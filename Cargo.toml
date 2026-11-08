@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 gpui-kit = "0.9"
 idevice = { version = "0.1.68", features = ["afc", "house_arrest", "installation_proxy", "usbmuxd", "pair"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "fs"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

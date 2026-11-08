@@ -48,6 +48,8 @@ Settings > Connect an agent has commands for other agents.
 
 Agent writes are off by default. Turn them on in the sidebar.
 
+`search_photos` finds photos by date range, album, favorite, and location. `list_photo_albums` lists album titles. Both copy `PhotoData/Photos.sqlite` to a private temp folder, query the copy read-only, and delete it after each call. Results are paths in the `media` root for `read_file` and `download_file`.
+
 ## Scope
 
 iOS gives USB access to the media partition (photos, videos, downloads) and to the Documents folder of apps that allow file sharing. It does not give access to the full filesystem.

@@ -596,3 +596,30 @@ pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::Path
     }
     Ok(written)
 }
+
+/// Stream a file from the phone to a local path in 1 MiB pieces. Returns the bytes copied.
+/// Use for large files: `read_file` holds the whole file in memory.
+pub async fn copy_to_local(udid: &str, root: &Root, path: &str, dest: &std::path::Path) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let path = real(root, path);
+    Ok(with_afc!(udid, root, |c| {
+        let mut f = c.open(path.as_str(), AfcFopenMode::RdOnly).await?;
+        let r: Result<u64> = async {
+            let mut out = tokio::fs::File::create(dest).await?;
+            let mut n = 0u64;
+            loop {
+                let chunk = f.read_n(1 << 20).await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                out.write_all(&chunk).await?;
+                n += chunk.len() as u64;
+            }
+            out.flush().await?;
+            Ok(n)
+        }
+        .await;
+        f.close().await.ok();
+        r
+    }))
+}

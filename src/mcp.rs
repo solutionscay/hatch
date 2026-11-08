@@ -189,6 +189,12 @@ fn tools() -> Value {
         {"name":"delete","description":"Delete a file or directory tree on the iPhone. Disabled unless the user enables writes in the Hatch window.",
          "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path},"required":["path"]}}
     ])
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+    .into_iter()
+    .chain(crate::photos::tools())
+    .collect()
 }
 
 fn text(s: impl Into<String>) -> Vec<Value> {
@@ -269,6 +275,10 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
             write_gate()?;
             device::delete(&udid_of(args).await?, &root, path).await?;
             Ok(text(format!("deleted {path}")))
+        }
+        n if crate::photos::handles(n) => {
+            let r = crate::photos::call(&udid_of(args).await?, n, args).await?;
+            Ok(text(serde_json::to_string_pretty(&r)?))
         }
         _ => anyhow::bail!("unknown tool {name}"),
     }

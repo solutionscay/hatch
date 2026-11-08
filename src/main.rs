@@ -2,6 +2,7 @@ mod device;
 mod devinfo;
 mod mcp;
 mod transfer;
+mod photos;
 
 use device::{App, Device, Entry, Root};
 use gpui_kit::component::{Icon, IconName, Sizable, Theme, ThemeMode, TitleBar, h_flex, v_flex};
