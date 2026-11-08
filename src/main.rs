@@ -14,6 +14,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
+actions!(hatch, [
+    /// Close the top open panel, or clear the selection.
+    CloseTop
+]);
+
 fn rt() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime"))
@@ -106,6 +111,8 @@ struct Hatch {
     allow_writes: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
     token: Arc<std::sync::RwLock<String>>,
+    /// Focus for the whole window, so Escape works without a click first.
+    focus: FocusHandle,
 }
 
 impl Hatch {
@@ -159,6 +166,7 @@ impl Hatch {
             allow_writes,
             calls,
             token,
+            focus: cx.focus_handle(),
         };
         Self::start_info_poll(cx);
         // Poll for devices and keep the call counter fresh.
@@ -943,6 +951,29 @@ impl Hatch {
     }
 }
 
+impl Hatch {
+    /// Escape: close one thing, the top one first. Agent drawer, then Settings, then the preview.
+    /// With none open, clear the picked files. A focused text field takes Escape first
+    /// because its key context is deeper than "Hatch".
+    fn close_top(&mut self, _: &CloseTop, _: &mut Window, cx: &mut Context<Self>) {
+        if self.show_log {
+            self.show_log = false;
+        } else if self.page_settings {
+            self.page_settings = false;
+        } else if self.selected.is_some() || self.preview.is_some() {
+            self.selected = None;
+            self.preview = None;
+        } else if !self.picked.is_empty() {
+            self.picked.clear();
+            self.anchor = None;
+        } else {
+            cx.propagate();
+            return;
+        }
+        cx.notify();
+    }
+}
+
 impl Render for Hatch {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let me = cx.entity();
@@ -1511,6 +1542,9 @@ impl Render for Hatch {
         v_flex()
             .relative()
             .size_full()
+            .track_focus(&self.focus)
+            .key_context("Hatch")
+            .on_action(cx.listener(Self::close_top))
             .bg(ground())
             .text_color(ink())
             .font_family(sans())
@@ -1526,13 +1560,20 @@ fn main() {
     let _ = rt();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
+        cx.bind_keys([KeyBinding::new("escape", CloseTop, Some("Hatch"))]);
         Theme::change(ThemeMode::Dark, None, cx);
         let opts = WindowOptions {
             window_background: WindowBackgroundAppearance::Blurred,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1180.), px(740.)), cx))),
             ..TitleBar::window_options()
         };
-        gpui_kit::open_window(opts, cx, |_, cx| cx.new(Hatch::new)).expect("failed to open window");
+        gpui_kit::open_window(opts, cx, |window, cx| {
+            let view = cx.new(Hatch::new);
+            let focus = view.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            view
+        })
+        .expect("failed to open window");
         cx.activate(true);
     });
 }
