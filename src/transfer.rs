@@ -3,6 +3,7 @@
 
 use crate::device::{self, Entry, Transfer};
 use crate::*;
+use gpui_kit::component::tooltip::Tooltip;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +31,24 @@ fn short_path(p: &std::path::Path) -> String {
         Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
         _ => p.display().to_string(),
     }
+}
+
+/// Style of a bottom-bar button.
+enum Btn {
+    /// Text only. Fills on hover.
+    Quiet,
+    /// The one accented action at the right of a bar, with a Lucide icon.
+    Primary(&'static str),
+}
+
+/// Frame of the bars under the file view (selection, transfer). Same edges and background as the side panels.
+fn bottom_bar() -> Div {
+    v_flex().relative().flex_none().border_t_1().border_color(line()).bg(panel())
+}
+
+/// One row in a bottom bar. px_4 lines up with the file rows above it.
+fn bar_row() -> Div {
+    h_flex().h(px(44.)).px_4().gap_2().items_center()
 }
 
 fn plural(n: usize) -> &'static str {
@@ -215,21 +234,41 @@ impl Hatch {
             })
     }
 
-    fn text_btn(&self, id: &'static str, label: &str, accent: bool, enabled: bool, cx: &mut Context<Self>, f: impl Fn(&mut Hatch, &mut Context<Hatch>) + 'static) -> Stateful<Div> {
+    /// Button for the bars under the file view. All have the same height.
+    fn bar_btn(
+        &self,
+        id: &'static str,
+        label: &str,
+        kind: Btn,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Hatch, &mut Context<Hatch>) + 'static,
+    ) -> Stateful<Div> {
         let me = cx.entity();
+        let (primary, icon) = match kind {
+            Btn::Quiet => (false, None),
+            Btn::Primary(icon) => (true, Some(icon)),
+        };
         div()
             .id(id)
-            .h(px(26.))
+            .h(px(28.))
             .px_3()
+            .gap_1p5()
             .flex()
             .flex_none()
             .items_center()
-            .border_1()
-            .border_color(if accent && enabled { rgba(0x5fd4a057) } else { line() })
-            .bg(if accent && enabled { acc_s() } else { wash() })
             .text_size(px(12.))
-            .text_color(if !enabled { faint() } else if accent { acc() } else { dim() })
-            .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(wash2())))
+            .text_color(if !enabled { faint() } else if primary { acc() } else { dim() })
+            .when(primary, |d| {
+                d.border_1()
+                    .border_color(if enabled { rgba(0x5fd4a057) } else { line() })
+                    .bg(if enabled { acc_s() } else { wash() })
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .when(enabled, |d| {
+                d.cursor_pointer().hover(move |d| if primary { d.bg(rgba(0x5fd4a033)) } else { d.bg(wash()).text_color(ink()) })
+            })
+            .when_some(icon, |d, p| d.child(Icon::empty().path(p).small()))
             .child(label.to_string())
             .on_click(move |_, _, cx| {
                 if enabled {
@@ -240,33 +279,33 @@ impl Hatch {
 
     /// Bar under the file list while files are picked.
     pub fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.picked.is_empty() {
+        // Count only picked files that are still listed. The list empties when the phone goes away.
+        let (n, bytes) = self.entries.iter().filter(|e| self.picked.contains(&e.name)).fold((0, 0u64), |(n, b), e| (n + 1, b + e.size));
+        if n == 0 {
             return None;
         }
-        let n = self.picked.len();
-        let bytes: u64 = self.entries.iter().filter(|e| self.picked.contains(&e.name)).map(|e| e.size).sum();
         let files = self.entries.iter().filter(|e| !e.is_dir).count();
         let busy = self.job_running();
+        let label = div()
+            .id("sel-count")
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .child(format!("{n} selected · {}", human(bytes)))
+            .tooltip(|w, cx| Tooltip::new("Ctrl-click adds or removes a file. Shift-click picks a range.").build(w, cx));
         Some(
-            h_flex()
-                .h(px(44.))
-                .flex_none()
-                .px_4()
-                .gap_2()
-                .items_center()
-                .border_t_1()
-                .border_color(line())
-                .bg(wash())
-                .child(div().text_color(ink()).child(format!("{n} selected")))
-                .child(div().flex_1().font_family(mono()).text_size(px(12.)).text_color(faint()).child(human(bytes)))
-                .child(div().text_size(px(11.)).text_color(faint()).child("Ctrl-click adds · Shift-click picks a range"))
-                .child(self.text_btn("sel-all", "Select all", false, n < files, cx, |t, cx| t.pick_all(cx)))
-                .child(self.text_btn("sel-clear", "Clear", false, true, cx, |t, cx| {
-                    t.picked.clear();
-                    t.anchor = None;
-                    cx.notify();
-                }))
-                .child(self.text_btn("sel-download", "Download…", true, !busy, cx, |t, cx| t.choose_download_folder(cx)))
+            bottom_bar()
+                .child(
+                    bar_row()
+                        .child(label)
+                        .child(self.bar_btn("sel-all", "Select all", Btn::Quiet, n < files, cx, |t, cx| t.pick_all(cx)))
+                        .child(self.bar_btn("sel-clear", "Clear", Btn::Quiet, true, cx, |t, cx| {
+                            t.picked.clear();
+                            t.anchor = None;
+                            cx.notify();
+                        }))
+                        .child(self.bar_btn("sel-download", "Download…", Btn::Primary("icons/download.svg"), !busy, cx, |t, cx| t.choose_download_folder(cx))),
+                )
                 .into_any_element(),
         )
     }
@@ -276,8 +315,8 @@ impl Hatch {
         let j = self.job.as_ref()?;
         let (done, total) = (j.t.done.load(Ordering::Relaxed), j.t.total.load(Ordering::Relaxed));
         let frac = if total == 0 { 0. } else { (done as f32 / total as f32).clamp(0., 1.) };
-        let mut bar = v_flex().flex_none().border_t_1().border_color(line()).bg(panel());
-        let row = h_flex().h(px(44.)).px_4().gap_3().items_center();
+        let mut bar = bottom_bar();
+        let row = bar_row();
         let row = match &j.outcome {
             None => {
                 let k = (j.t.files_done.load(Ordering::Relaxed) + 1).min(j.count);
@@ -293,8 +332,8 @@ impl Hatch {
                             .text_color(ink())
                             .child(format!("{verb} {k} of {} · {cur} · to {}", j.count, j.place)),
                     )
-                    .child(div().flex_none().font_family(mono()).text_size(px(12.)).text_color(dim()).child(format!("{} of {}", human(done), human(total))))
-                    .child(self.text_btn("xfer-cancel", if cancelling { "Stopping…" } else { "Cancel" }, false, !cancelling, cx, |t, cx| {
+                    .child(div().flex_none().text_color(dim()).child(format!("{} of {}", human(done), human(total))))
+                    .child(self.bar_btn("xfer-cancel", if cancelling { "Stopping…" } else { "Cancel" }, Btn::Quiet, !cancelling, cx, |t, cx| {
                         if let Some(j) = &t.job {
                             j.t.cancel.store(true, Ordering::Relaxed);
                         }
@@ -308,15 +347,17 @@ impl Hatch {
                 };
                 row.child(Icon::new(if ok { IconName::Check } else { IconName::Info }).small().text_color(if ok { acc() } else { cor() }))
                     .child(div().flex_1().min_w_0().truncate().text_color(if ok { ink() } else { cor() }).child(text))
-                    .child(self.text_btn("xfer-close", "Close", false, true, cx, |t, cx| {
+                    .child(self.bar_btn("xfer-close", "Close", Btn::Quiet, true, cx, |t, cx| {
                         t.job = None;
                         cx.notify();
                     }))
             }
         };
+        bar = bar.child(row);
         if j.running() {
-            bar = bar.child(div().h(px(2.)).w_full().bg(wash()).child(div().h_full().w(relative(frac)).bg(acc())));
+            // Over the top edge, so this bar has the same height as the selection bar.
+            bar = bar.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(wash()).child(div().h_full().w(relative(frac)).bg(acc())));
         }
-        Some(bar.child(row).into_any_element())
+        Some(bar.into_any_element())
     }
 }
