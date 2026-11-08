@@ -141,12 +141,16 @@ impl Hatch {
                 let devices = rt().spawn(device::list_devices()).await;
                 let ok = this
                     .update(cx, |this, cx| {
+                        // Re-render only on change: a full frame is costly on a software renderer.
+                        let before = (this.devices.clone(), this.status.clone());
                         match devices {
                             Ok(Ok(d)) => this.set_devices(d, cx),
                             Ok(Err(e)) => this.status = format!("{e:#}"),
                             Err(_) => {}
                         }
-                        cx.notify();
+                        if before != (this.devices.clone(), this.status.clone()) {
+                            cx.notify();
+                        }
                     })
                     .is_ok();
                 if !ok {

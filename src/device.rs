@@ -12,7 +12,7 @@ use idevice::{
 };
 use serde::Serialize;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Device {
     pub udid: String,
     pub name: String,
