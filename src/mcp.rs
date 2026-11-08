@@ -212,7 +212,7 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
         if st.allow_writes.load(Ordering::Relaxed) {
             Ok(())
         } else {
-            anyhow::bail!("writes are disabled. Ask the user to enable 'Allow agent writes' in Hatch.")
+            anyhow::bail!("writes are disabled. Ask the user to turn on 'Agent writes' in Hatch.")
         }
     };
     match name {

@@ -82,6 +82,7 @@ struct Hatch {
     settings: Settings,
     page_settings: bool,
     copied: Option<String>,
+    copied_gen: u64,
     log: Arc<std::sync::Mutex<Vec<mcp::LogEntry>>>,
     preview: Option<Preview>,
     thumbs: std::collections::HashMap<String, Arc<gpui::Image>>,
@@ -122,6 +123,7 @@ impl Hatch {
             settings: load_settings(),
             page_settings: false,
             copied: None,
+            copied_gen: 0,
             favs: load_favs(),
             epoch: 0,
             devices: vec![],
@@ -344,28 +346,28 @@ impl Hatch {
         if let Err(e) = mcp::rotate_token(&self.token) {
             self.error = Some(format!("Could not rotate the MCP token: {e:#}"));
         }
-        self.copied = Some("rotated".into());
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(1600)).await;
-            this.update(cx, |this, cx| {
-                this.copied = None;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.flash_copied("rotated", cx);
     }
 
     fn copy_text(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.flash_copied(id, cx);
+    }
+
+    /// Shows a "Copied"/"Rotated" label for 1.6 s. A timer clears only the
+    /// label it set, so an earlier click cannot clear a later label early.
+    fn flash_copied(&mut self, id: &str, cx: &mut Context<Self>) {
         self.copied = Some(id.to_string());
+        self.copied_gen = self.copied_gen.wrapping_add(1);
+        let seq = self.copied_gen;
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1600)).await;
             this.update(cx, |this, cx| {
-                this.copied = None;
-                cx.notify();
+                if this.copied_gen == seq {
+                    this.copied = None;
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -713,6 +715,7 @@ impl Hatch {
                 format!("codex mcp remove hatch >/dev/null 2>&1; printf '\\n[mcp_servers.hatch]\\nurl = \"{url}\"\\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\\n' >> {codex_cfg}"),
             ),
             ("gemini", "Gemini CLI", format!("gemini mcp add --scope user --transport http hatch {url} --header \"{auth}\"")),
+            ("agy", "Antigravity (agy)", format!("agy mcp add --header \"{auth}\" hatch {url}")),
             ("grok", "Grok", format!("grok mcp add --transport http hatch {url} --header \"{auth}\"")),
             (
                 "json",
@@ -1410,6 +1413,7 @@ impl Render for Hatch {
             overlay.push(
                 div()
                     .id("scrim")
+                    .occlude()
                     .absolute()
                     .top(px(35.))
                     .left_0()
