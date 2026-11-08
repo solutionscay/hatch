@@ -172,6 +172,8 @@ fn tools() -> Value {
     json!([
         {"name":"list_devices","description":"List USB-connected iPhones and whether they trust this computer.",
          "inputSchema":{"type":"object","properties":{}}},
+        {"name":"device_info","description":"Read-only device info: name, model, iOS version and build, serial, UDID, battery level and charging state, total and free storage in bytes.",
+         "inputSchema":{"type":"object","properties":{"udid":dev}}},
         {"name":"list_apps","description":"List apps that expose a Documents folder (iTunes file sharing).",
          "inputSchema":{"type":"object","properties":{"udid":dev}}},
         {"name":"list_dir","description":"List a directory on the iPhone.",
@@ -217,6 +219,10 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
     };
     match name {
         "list_devices" => Ok(text(serde_json::to_string_pretty(&device::list_devices().await?)?)),
+        "device_info" => {
+            let u = udid_of(args).await?;
+            Ok(text(serde_json::to_string_pretty(&crate::devinfo::device_info(&u).await?)?))
+        }
         "list_apps" => {
             let u = udid_of(args).await?;
             Ok(text(serde_json::to_string_pretty(&device::list_apps(&u).await?)?))

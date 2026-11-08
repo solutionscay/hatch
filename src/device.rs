@@ -126,7 +126,7 @@ pub fn explain(e: &anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-async fn provider_for(udid: &str) -> Result<UsbmuxdProvider> {
+pub(crate) async fn provider_for(udid: &str) -> Result<UsbmuxdProvider> {
     let addr = UsbmuxdAddr::default();
     let mut mux = mux().await?;
     let dev = mux.get_device(udid).await?;
@@ -163,7 +163,7 @@ pub async fn list_devices() -> Result<Vec<Device>> {
     Ok(out)
 }
 
-async fn session(p: &UsbmuxdProvider) -> Result<LockdownClient> {
+pub(crate) async fn session(p: &UsbmuxdProvider) -> Result<LockdownClient> {
     let mut lockdown = LockdownClient::connect(p).await?;
     let pf = p.get_pairing_file().await?;
     lockdown.start_session(&pf).await?;

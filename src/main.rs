@@ -1,4 +1,5 @@
 mod device;
+mod devinfo;
 mod mcp;
 
 use device::{App, Device, Entry, Root};
@@ -72,6 +73,7 @@ struct Hatch {
     favs: Vec<Fav>,
     epoch: u64,
     devices: Vec<Device>,
+    info: Option<devinfo::DeviceInfo>,
     udid: Option<String>,
     apps: Vec<App>,
     root: Root,
@@ -127,6 +129,7 @@ impl Hatch {
             favs: load_favs(),
             epoch: 0,
             devices: vec![],
+            info: None,
             udid: None,
             apps: vec![],
             root: Root::Media,
@@ -146,6 +149,7 @@ impl Hatch {
             calls,
             token,
         };
+        Self::start_info_poll(cx);
         // Poll for devices and keep the call counter fresh.
         cx.spawn(async move |this, cx| {
             loop {
@@ -1003,6 +1007,9 @@ impl Render for Hatch {
                     ),
                 );
             }
+        }
+        if let Some(card) = self.info_card() {
+            side = side.child(card);
         }
         if paired {
             let mut nav = v_flex();
