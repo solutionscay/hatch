@@ -751,7 +751,7 @@ impl Hatch {
                 .items_center()
                 .border_b_1()
                 .border_color(line())
-                .child(div().size(px(28.)).flex_none().flex().items_center().justify_center().bg(wash()).child(Icon::new(IconName::Info).small().text_color(faint())))
+                .child(div().size(px(28.)).flex_none().flex().items_center().justify_center().bg(wash()).child(Icon::empty().path(if writes { "icons/pen.svg" } else { "icons/lock.svg" }).small().text_color(if writes { amb() } else { faint() })))
                 .child(
                     v_flex()
                         .flex_1()
@@ -1007,7 +1007,7 @@ impl Render for Hatch {
                     .cursor_pointer()
                     .border_t_1()
                     .border_color(line())
-                    .child(Icon::new(if writes { IconName::Check } else { IconName::Eye }).small().text_color(if writes { amb() } else { faint() }))
+                    .child(Icon::empty().path(if writes { "icons/pen.svg" } else { "icons/lock.svg" }).small().text_color(if writes { amb() } else { faint() }))
                     .child(div().flex_1().truncate().font_weight(FontWeight::MEDIUM).child("Agent writes"))
                     .child(div().flex_none().text_size(px(11.)).text_color(if writes { amb() } else { faint() }).child(if writes { "On" } else { "Off" }))
                     .child(
