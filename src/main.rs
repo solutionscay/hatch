@@ -675,9 +675,36 @@ impl Hatch {
             .on_click(move |_, _, cx| me.update(cx, |this, cx| f(this, !on, cx)))
     }
 
+    /// Copy button that flashes "Copied" for 1.6 s.
+    fn copy_btn(&self, id: &'static str, text: String, cx: &mut Context<Self>) -> Stateful<Div> {
+        let me = cx.entity();
+        let done = self.copied.as_deref() == Some(id);
+        div()
+            .id(SharedString::from(format!("copy-{id}")))
+            .h(px(26.))
+            .px_3()
+            .flex()
+            .flex_none()
+            .items_center()
+            .cursor_pointer()
+            .border_1()
+            .border_color(if done { rgba(0x5fd4a057) } else { line() })
+            .bg(if done { acc_s() } else { wash() })
+            .text_size(px(12.))
+            .text_color(if done { acc() } else { dim() })
+            .hover(|d| d.bg(wash2()))
+            .child(if done { "Copied" } else { "Copy" })
+            .on_click(move |_, _, cx| {
+                let t = text.clone();
+                me.update(cx, |this, cx| this.copy_text(id, t, cx))
+            })
+    }
+
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // pb_4 matches the pt_4 above each section header, so the last section does not touch the panel edge.
         let mut page = v_flex().w_full().pb_4();
+        page = page.child(section("Device"));
+        page = page.child(self.device_section(cx));
         page = page.child(section("Locations"));
         page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Choose which locations appear in the sidebar. Hidden locations still work for the agent."));
         page = page.child(self.settings_row(
@@ -743,9 +770,6 @@ impl Hatch {
             ("token", "Access token", token.clone()),
         ];
         for (id, label, text) in snippets {
-            let me = cx.entity();
-            let done = self.copied.as_deref() == Some(id);
-            let t2 = text.clone();
             page = page.child(
                 v_flex()
                     .px_6()
@@ -778,26 +802,7 @@ impl Hatch {
                                         .child(if rotated { "Rotated" } else { "Rotate" })
                                         .on_click(move |_, _, cx| me.update(cx, |this, cx| this.rotate_token(cx))),
                                 )
-                            }).child(
-                                div()
-                                    .id(SharedString::from(format!("copy-{id}")))
-                                    .h(px(26.))
-                                    .px_3()
-                                    .flex()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .border_1()
-                                    .border_color(if done { rgba(0x5fd4a057) } else { line() })
-                                    .bg(if done { acc_s() } else { wash() })
-                                    .text_size(px(12.))
-                                    .text_color(if done { acc() } else { dim() })
-                                    .hover(|d| d.bg(wash2()))
-                                    .child(if done { "Copied" } else { "Copy" })
-                                    .on_click(move |_, _, cx| {
-                                        let t = t2.clone();
-                                        me.update(cx, |this, cx| this.copy_text(id, t, cx))
-                                    }),
-                            )),
+                            }).child(self.copy_btn(id, text.clone(), cx))),
                     )
                     .child(
                         div()
@@ -970,6 +975,7 @@ impl Render for Hatch {
 
         // ---- sidebar (flush column)
         let mut side = v_flex().w(px(248.)).h_full().flex_none().bg(panel()).border_r_1().border_color(line());
+        let widget = self.info_widget();
         side = side.child(match &dev {
             None => h_flex()
                 .h(px(56.))
@@ -987,8 +993,7 @@ impl Render for Hatch {
                 .px_4()
                 .gap_3()
                 .items_center()
-                .border_b_1()
-                .border_color(line())
+                .when(widget.is_none(), |h| h.border_b_1().border_color(line()))
                 .child(div().size(px(36.)).flex_none().bg(wash()).flex().items_center().justify_center().child(Icon::empty().path("icons/smartphone.svg").text_color(dim())))
                 .child(
                     v_flex()
@@ -1001,6 +1006,10 @@ impl Render for Hatch {
                         })),
                 ),
         });
+        if let Some(w) = widget {
+            // Header and widget read as one block; the divider moves below the widget.
+            side = side.child(w.flex_none().border_b_1().border_color(line()));
+        }
         if let Some(d) = &dev {
             if !d.paired {
                 side = side.child(
@@ -1021,9 +1030,7 @@ impl Render for Hatch {
                 );
             }
         }
-        if let Some(card) = self.info_card() {
-            side = side.child(card);
-        }
+
         if paired {
             let mut nav = v_flex();
             if !self.favs.is_empty() {

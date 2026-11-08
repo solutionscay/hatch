@@ -1,10 +1,11 @@
 //! Device info: identity, battery, storage. Read-only lockdown GetValue calls.
-//! Also holds the sidebar card and its refresh loop.
+//! Also holds the sidebar widget, the Settings rows, and the refresh loop.
 
 use crate::device;
 use crate::{Hatch, dim, faint, ink, line, mono, rt, wash};
 use anyhow::Result;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use idevice::lockdown::LockdownClient;
 use plist::{Dictionary, Value};
@@ -84,14 +85,6 @@ fn bar(frac: f32, color: Rgba) -> Div {
     div().h(px(4.)).w_full().bg(wash()).child(div().h_full().w(relative(frac)).bg(color))
 }
 
-fn row(label: &'static str, value: String) -> Div {
-    h_flex()
-        .h(px(18.))
-        .gap_2()
-        .child(div().w(px(56.)).flex_none().text_color(faint()).child(label))
-        .child(div().flex_1().min_w_0().truncate().text_color(dim()).child(value))
-}
-
 const REFRESH: Duration = Duration::from_secs(30);
 
 impl Hatch {
@@ -159,15 +152,67 @@ impl Hatch {
         .detach();
     }
 
-    /// Small battery + storage card for the sidebar. None until the first reading arrives.
-    pub(crate) fn info_card(&self) -> Option<Div> {
-        let i = self.info.as_ref()?;
-        if self.udid.as_deref() != Some(i.udid.as_str()) {
-            return None;
-        }
-        let mut card = v_flex().px_4().py_3().gap_2().text_size(px(11.)).border_b_1().border_color(line());
+    /// The reading for the selected phone, if it has arrived.
+    fn current_info(&self) -> Option<&DeviceInfo> {
+        self.info.as_ref().filter(|i| self.udid.as_deref() == Some(i.udid.as_str()))
+    }
+
+    /// Two short lines under the device header: battery and free storage.
+    /// None until the first reading arrives.
+    pub(crate) fn info_widget(&self) -> Option<Div> {
+        let i = self.current_info()?;
+        let mut w = v_flex().px_4().pb_3().gap_1().text_size(px(11.)).font_family(mono());
 
         if let Some(level) = i.battery_level {
+            let charging = i.charging == Some(true);
+            let low = level <= 20 && !charging;
+            let glyph = if low {
+                "icons/battery-low.svg"
+            } else if level <= 60 {
+                "icons/battery-medium.svg"
+            } else {
+                "icons/battery-full.svg"
+            };
+            let color = if low { crate::cor() } else { dim() };
+            w = w.child(
+                h_flex()
+                    .h(px(18.))
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::empty().path(glyph).xsmall().text_color(color))
+                    .child(div().text_color(if low { color } else { ink() }).child(format!("{level}%")))
+                    .when(charging || i.external_power == Some(true), |d| {
+                        d.child(Icon::empty().path("icons/zap.svg").xsmall().text_color(if charging { crate::acc() } else { faint() }))
+                    }),
+            );
+        }
+
+        let total = i.storage_data_total.or(i.storage_total);
+        if let (Some(total), Some(free)) = (total, i.storage_free) {
+            let used = total.saturating_sub(free);
+            let frac = if total > 0 { used as f32 / total as f32 } else { 0.0 };
+            let full = frac >= 0.9;
+            w = w.child(
+                h_flex()
+                    .h(px(18.))
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::empty().path("icons/hard-drive.svg").xsmall().text_color(if full { crate::amb() } else { dim() }))
+                    .child(div().flex_none().text_color(if full { crate::amb() } else { ink() }).child(format!("{} free", gb(free))))
+                    .child(div().flex_1().min_w(px(24.)).child(bar(frac, if full { crate::amb() } else { faint() }))),
+            );
+        }
+        Some(w)
+    }
+
+    /// Identity rows for Settings > Device.
+    pub(crate) fn device_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut sec = v_flex();
+        let Some(i) = self.current_info() else {
+            return sec.child(div().px_6().py_3().text_size(px(12.)).text_color(faint()).child("Details appear here once an iPhone is connected and trusted."));
+        };
+        let total = i.storage_data_total.or(i.storage_total);
+        let battery = i.battery_level.map(|l| {
             let state = if i.fully_charged == Some(true) && i.external_power == Some(true) {
                 "Charged"
             } else if i.charging == Some(true) {
@@ -177,45 +222,39 @@ impl Hatch {
             } else {
                 "On battery"
             };
-            let color = if level <= 20 && i.charging != Some(true) { crate::cor() } else { crate::acc() };
-            card = card.child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(div().text_color(faint()).child("Battery"))
-                            .child(div().font_family(mono()).text_color(ink()).child(format!("{level}% · {state}"))),
-                    )
-                    .child(bar(level as f32 / 100.0, color)),
+            format!("{l}% · {state}")
+        });
+        let storage = match (total, i.storage_free) {
+            (Some(t), Some(f)) => Some(format!("{} free · {} used of {}", gb(f), gb(t.saturating_sub(f)), gb(t))),
+            _ => None,
+        };
+        let rows: [(&'static str, &'static str, Option<String>); 9] = [
+            ("dev-name", "Name", Some(i.name.clone())),
+            ("dev-model", "Model", Some(i.model.clone())),
+            ("dev-modelno", "Model number", Some(i.model_number.clone())),
+            ("dev-ios", "iOS version", Some(i.ios.clone())),
+            ("dev-build", "Build", Some(i.build.clone())),
+            ("dev-serial", "Serial", Some(i.serial.clone())),
+            ("dev-udid", "UDID", Some(i.udid.clone())),
+            ("dev-battery", "Battery", battery),
+            ("dev-storage", "Storage", storage),
+        ];
+        for (id, label, value) in rows {
+            let Some(value) = value.filter(|v| !v.is_empty()) else { continue };
+            let copy = matches!(id, "dev-serial" | "dev-udid");
+            sec = sec.child(
+                h_flex()
+                    .h(px(40.))
+                    .px_6()
+                    .gap_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(line())
+                    .child(div().w(px(112.)).flex_none().text_color(faint()).child(label))
+                    .child(div().flex_1().min_w_0().truncate().font_family(mono()).text_size(px(12.)).text_color(ink()).child(value.clone()))
+                    .when(copy, |d| d.child(self.copy_btn(id, value, cx))),
             );
         }
-
-        let total = i.storage_data_total.or(i.storage_total);
-        if let (Some(total), Some(free)) = (total, i.storage_free) {
-            let used = total.saturating_sub(free);
-            let frac = if total > 0 { used as f32 / total as f32 } else { 0.0 };
-            let color = if frac >= 0.9 { crate::amb() } else { dim() };
-            card = card.child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(div().text_color(faint()).child("Storage"))
-                            .child(div().font_family(mono()).text_color(ink()).child(format!("{} free", gb(free)))),
-                    )
-                    .child(bar(frac, color))
-                    .child(div().text_color(faint()).child(format!("{} used of {}", gb(used), gb(total)))),
-            );
-        }
-
-        if !i.serial.is_empty() {
-            card = card.child(row("Serial", i.serial.clone()));
-        }
-        if !i.build.is_empty() {
-            card = card.child(row("Build", i.build.clone()));
-        }
-        Some(card)
+        sec
     }
 }
