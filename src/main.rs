@@ -94,6 +94,7 @@ struct Hatch {
     busy: bool,
     allow_writes: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
+    token: Arc<std::sync::RwLock<String>>,
 }
 
 impl Hatch {
@@ -101,7 +102,8 @@ impl Hatch {
         let allow_writes = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
         let log: Arc<std::sync::Mutex<Vec<mcp::LogEntry>>> = Default::default();
-        let state = mcp::McpState { allow_writes: allow_writes.clone(), calls: calls.clone(), log: log.clone() };
+        let token = Arc::new(std::sync::RwLock::new(mcp::load_or_create_token()));
+        let state = mcp::McpState { allow_writes: allow_writes.clone(), calls: calls.clone(), log: log.clone(), token: token.clone() };
         let mut error = None;
         // Bind synchronously so a port clash shows up in the UI.
         match std::net::TcpListener::bind(("127.0.0.1", mcp::PORT)) {
@@ -140,6 +142,7 @@ impl Hatch {
             busy: false,
             allow_writes,
             calls,
+            token,
         };
         // Poll for devices and keep the call counter fresh.
         cx.spawn(async move |this, cx| {
@@ -335,6 +338,23 @@ impl Hatch {
         }
         save_settings(&self.settings);
         cx.notify();
+    }
+
+    fn rotate_token(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = mcp::rotate_token(&self.token) {
+            self.error = Some(format!("Could not rotate the MCP token: {e:#}"));
+        }
+        self.copied = Some("rotated".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1600)).await;
+            this.update(cx, |this, cx| {
+                this.copied = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn copy_text(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
@@ -680,15 +700,27 @@ impl Hatch {
             },
         ));
         page = page.child(section("Connect an agent"));
-        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Hatch must be running. Run one of these once, then ask your agent to list the iPhone's files."));
+        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Hatch must be running. Run one of these once, then ask your agent to list the iPhone's files. Each command holds the access token. After you rotate the token, run the command again."));
         let url = format!("http://127.0.0.1:{}/mcp", mcp::PORT);
+        let token = self.token.read().unwrap().clone();
+        let auth = format!("Authorization: Bearer {token}");
+        let codex_cfg = "\"${CODEX_HOME:-$HOME/.codex}/config.toml\"";
         let snippets: Vec<(&str, &str, String)> = vec![
-            ("cc", "Claude Code", format!("claude mcp add --transport http hatch {url}")),
-            ("codex", "Codex", format!("codex mcp add hatch --url {url}")),
-            ("gemini", "Gemini CLI", format!("gemini mcp add --scope user --transport http hatch {url}")),
-            ("grok", "Grok", format!("grok mcp add --transport http hatch {url}")),
-            ("json", "Other clients (JSON)", format!("{{\"mcpServers\":{{\"hatch\":{{\"type\":\"http\",\"url\":\"{url}\"}}}}}}")),
+            ("cc", "Claude Code", format!("claude mcp remove hatch >/dev/null 2>&1; claude mcp add --transport http hatch {url} --header \"{auth}\"")),
+            (
+                "codex",
+                "Codex",
+                format!("codex mcp remove hatch >/dev/null 2>&1; printf '\\n[mcp_servers.hatch]\\nurl = \"{url}\"\\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\\n' >> {codex_cfg}"),
+            ),
+            ("gemini", "Gemini CLI", format!("gemini mcp add --scope user --transport http hatch {url} --header \"{auth}\"")),
+            ("grok", "Grok", format!("grok mcp add --transport http hatch {url} --header \"{auth}\"")),
+            (
+                "json",
+                "Other clients (JSON)",
+                format!("{{\"mcpServers\":{{\"hatch\":{{\"type\":\"http\",\"url\":\"{url}\",\"headers\":{{\"Authorization\":\"Bearer {token}\"}}}}}}}}"),
+            ),
             ("url", "Endpoint URL", url.clone()),
+            ("token", "Access token", token.clone()),
         ];
         for (id, label, text) in snippets {
             let me = cx.entity();
@@ -706,7 +738,27 @@ impl Hatch {
                             .justify_between()
                             .items_center()
                             .child(div().text_color(ink()).child(label))
-                            .child(
+                            .child(h_flex().gap_2().when(id == "token", |d| {
+                                let me = cx.entity();
+                                let rotated = self.copied.as_deref() == Some("rotated");
+                                d.child(
+                                    div()
+                                        .id("rotate-token")
+                                        .h(px(26.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(if rotated { rgba(0x5fd4a057) } else { line() })
+                                        .bg(if rotated { acc_s() } else { wash() })
+                                        .text_size(px(12.))
+                                        .text_color(if rotated { acc() } else { dim() })
+                                        .hover(|d| d.bg(wash2()))
+                                        .child(if rotated { "Rotated" } else { "Rotate" })
+                                        .on_click(move |_, _, cx| me.update(cx, |this, cx| this.rotate_token(cx))),
+                                )
+                            }).child(
                                 div()
                                     .id(SharedString::from(format!("copy-{id}")))
                                     .h(px(26.))
@@ -725,7 +777,7 @@ impl Hatch {
                                         let t = t2.clone();
                                         me.update(cx, |this, cx| this.copy_text(id, t, cx))
                                     }),
-                            ),
+                            )),
                     )
                     .child(
                         div()
