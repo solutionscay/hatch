@@ -1,0 +1,203 @@
+//! Minimal MCP server (streamable HTTP, JSON responses) exposing the iPhone to an agent.
+
+use crate::device::{self, Root};
+use axum::{
+    Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+pub const PORT: u16 = 7433;
+
+#[derive(Clone)]
+pub struct LogEntry {
+    pub ts: String,
+    pub tool: String,
+    pub path: String,
+    pub ok: bool,
+    pub denied: bool,
+    pub write: bool,
+    pub ms: u128,
+}
+
+#[derive(Clone)]
+pub struct McpState {
+    pub allow_writes: Arc<AtomicBool>,
+    pub calls: Arc<AtomicUsize>,
+    pub log: Arc<std::sync::Mutex<Vec<LogEntry>>>,
+}
+
+pub async fn serve(state: McpState) -> anyhow::Result<()> {
+    let app = Router::new().route("/mcp", post(handle)).with_state(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", PORT)).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle(State(st): State<McpState>, headers: HeaderMap, body: String) -> Response {
+    // Block browser-origin requests (DNS rebinding / drive-by pages).
+    if let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !(o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost")) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(id) = req.get("id").cloned() else {
+        return StatusCode::ACCEPTED.into_response(); // notification
+    };
+    let method = req["method"].as_str().unwrap_or("");
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26"),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "hatch", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": "Browse and read files on a USB-connected iPhone. Root media is the phone media partition (photos under /DCIM, books, downloads). Any other root is an app bundle id (use list_apps) and maps to that app's Documents folder."
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/call" => {
+            st.calls.fetch_add(1, Ordering::Relaxed);
+            let name = req["params"]["name"].as_str().unwrap_or("").to_string();
+            let args = req["params"]["arguments"].clone();
+            let started = std::time::Instant::now();
+            let res = call(&st, &name, &args).await;
+            let denied = res.as_ref().err().is_some_and(|e| e.to_string().starts_with("writes are disabled"));
+            let mut log = st.log.lock().unwrap();
+            log.push(LogEntry {
+                ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                write: matches!(name.as_str(), "write_file" | "make_dir" | "delete"),
+                path: args["path"].as_str().or(args["dest"].as_str()).unwrap_or("-").to_string(),
+                tool: name.clone(),
+                ok: res.is_ok(),
+                denied,
+                ms: started.elapsed().as_millis(),
+            });
+            if log.len() > 500 {
+                log.remove(0);
+            }
+            drop(log);
+            Ok(match res {
+                Ok(content) => json!({ "content": content, "isError": false }),
+                Err(e) => json!({ "content": [{"type":"text","text": format!("{e:#}")}], "isError": true }),
+            })
+        }
+        _ => Err(json!({ "code": -32601, "message": "method not found" })),
+    };
+    let body = match result {
+        Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+        Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
+    };
+    ([("content-type", "application/json")], body.to_string()).into_response()
+}
+
+fn tools() -> Value {
+    let dev = json!({"type":"string","description":"Device UDID. Defaults to the first connected device."});
+    let root = json!({"type":"string","description":"'media' (camera roll) or an app bundle id from list_apps. Default 'media'."});
+    let path = json!({"type":"string","description":"Absolute path inside the root, e.g. /DCIM"});
+    json!([
+        {"name":"list_devices","description":"List USB-connected iPhones and whether they trust this computer.",
+         "inputSchema":{"type":"object","properties":{}}},
+        {"name":"list_apps","description":"List apps that expose a Documents folder (iTunes file sharing).",
+         "inputSchema":{"type":"object","properties":{"udid":dev}}},
+        {"name":"list_dir","description":"List a directory on the iPhone.",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path}}},
+        {"name":"read_file","description":"Read a file. Text is returned as text. Binary files are returned as base64. Output is capped by max_bytes (default 262144).",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"max_bytes":{"type":"integer"}},"required":["path"]}},
+        {"name":"download_file","description":"Copy a file from the iPhone to a path on this computer.",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"dest":{"type":"string","description":"Local destination file path"}},"required":["path","dest"]}},
+        {"name":"write_file","description":"Write text to a file on the iPhone. Disabled unless the user enables writes in the Hatch window.",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"text":{"type":"string"}},"required":["path","text"]}},
+        {"name":"make_dir","description":"Create a directory on the iPhone. Disabled unless the user enables writes in the Hatch window.",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path},"required":["path"]}},
+        {"name":"delete","description":"Delete a file or directory tree on the iPhone. Disabled unless the user enables writes in the Hatch window.",
+         "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path},"required":["path"]}}
+    ])
+}
+
+fn text(s: impl Into<String>) -> Vec<Value> {
+    vec![json!({"type":"text","text": s.into()})]
+}
+
+async fn udid_of(args: &Value) -> anyhow::Result<String> {
+    if let Some(u) = args["udid"].as_str() {
+        return Ok(u.to_string());
+    }
+    device::list_devices()
+        .await?
+        .into_iter()
+        .next()
+        .map(|d| d.udid)
+        .ok_or_else(|| anyhow::anyhow!("no iPhone connected over USB"))
+}
+
+async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Value>> {
+    let root = Root::parse(args["root"].as_str().unwrap_or("media"));
+    let path = args["path"].as_str().unwrap_or("/");
+    let write_gate = || -> anyhow::Result<()> {
+        if st.allow_writes.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            anyhow::bail!("writes are disabled. Ask the user to enable 'Allow agent writes' in Hatch.")
+        }
+    };
+    match name {
+        "list_devices" => Ok(text(serde_json::to_string_pretty(&device::list_devices().await?)?)),
+        "list_apps" => {
+            let u = udid_of(args).await?;
+            Ok(text(serde_json::to_string_pretty(&device::list_apps(&u).await?)?))
+        }
+        "list_dir" => {
+            let u = udid_of(args).await?;
+            Ok(text(serde_json::to_string_pretty(&device::list_dir(&u, &root, path).await?)?))
+        }
+        "read_file" => {
+            let u = udid_of(args).await?;
+            let max = args["max_bytes"].as_u64().unwrap_or(262_144) as usize;
+            let (data, total) = device::read_file(&u, &root, path, max).await?;
+            let note = if (data.len() as u64) < total {
+                format!("[truncated: {} of {} bytes]\n", data.len(), total)
+            } else {
+                String::new()
+            };
+            Ok(match String::from_utf8(data) {
+                Ok(s) => text(format!("{note}{s}")),
+                Err(e) => text(format!("{note}[binary, base64]\n{}", STANDARD.encode(e.into_bytes()))),
+            })
+        }
+        "download_file" => {
+            let u = udid_of(args).await?;
+            let dest = args["dest"].as_str().ok_or_else(|| anyhow::anyhow!("dest is required"))?;
+            let (data, _) = device::read_file(&u, &root, path, usize::MAX / 2).await?;
+            tokio::fs::write(dest, &data).await?;
+            Ok(text(format!("saved {} bytes to {dest}", data.len())))
+        }
+        "write_file" => {
+            write_gate()?;
+            let u = udid_of(args).await?;
+            let t = args["text"].as_str().unwrap_or("");
+            device::write_file(&u, &root, path, t.as_bytes()).await?;
+            Ok(text(format!("wrote {} bytes to {path}", t.len())))
+        }
+        "make_dir" => {
+            write_gate()?;
+            device::make_dir(&udid_of(args).await?, &root, path).await?;
+            Ok(text(format!("created {path}")))
+        }
+        "delete" => {
+            write_gate()?;
+            device::delete(&udid_of(args).await?, &root, path).await?;
+            Ok(text(format!("deleted {path}")))
+        }
+        _ => anyhow::bail!("unknown tool {name}"),
+    }
+}

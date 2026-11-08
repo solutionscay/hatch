@@ -1,0 +1,21 @@
+[package]
+name = "hatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "0.9"
+idevice = { version = "0.1.68", features = ["afc", "house_arrest", "installation_proxy", "usbmuxd", "pair"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+plist = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+# Image decoding and GPU code are unusably slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 3
