@@ -12,7 +12,21 @@ You need `usbmuxd` and an iPhone connected by USB.
 cargo run
 ```
 
-Unlock the phone and tap Trust when it asks.
+The first time, the iPhone must trust this computer:
+
+1. Unlock the iPhone.
+2. Click **Trust this computer** in the Hatch sidebar.
+3. On the iPhone, tap **Trust**.
+4. Enter the iPhone passcode.
+
+## Troubleshooting
+
+- **usbmuxd is not running.** Connect the iPhone. The service usually starts by itself. If it does not, run `sudo systemctl start usbmuxd`.
+- **usbmuxd is not installed.** Run `sudo apt install usbmuxd`. Then connect the iPhone again.
+- **The iPhone is locked.** Unlock it with the passcode. Then try again.
+- **No Trust dialog on the iPhone.** Unlock the iPhone first. Then click **Trust this computer** again.
+- **You tapped Don't Trust.** Unplug the iPhone and connect it again. Then pair again.
+- **No iPhone found.** Use a data cable, not a charge-only cable. Try a different USB port.
 
 ## Connect an agent
 

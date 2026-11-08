@@ -88,7 +88,7 @@ async fn handle(State(st): State<McpState>, headers: HeaderMap, body: String) ->
             drop(log);
             Ok(match res {
                 Ok(content) => json!({ "content": content, "isError": false }),
-                Err(e) => json!({ "content": [{"type":"text","text": format!("{e:#}")}], "isError": true }),
+                Err(e) => json!({ "content": [{"type":"text","text": crate::device::explain(&e)}], "isError": true }),
             })
         }
         _ => Err(json!({ "code": -32601, "message": "method not found" })),
