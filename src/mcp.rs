@@ -178,7 +178,7 @@ fn tools() -> Value {
          "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path}}},
         {"name":"read_file","description":"Read a file. Text is returned as text. Binary files are returned as base64. Output is capped by max_bytes (default 262144).",
          "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"max_bytes":{"type":"integer"}},"required":["path"]}},
-        {"name":"download_file","description":"Copy a file from the iPhone to a path on this computer.",
+        {"name":"download_file","description":"Copy a file from the iPhone to a path on this computer. Streams the file, so any size works. Replaces dest if it exists.",
          "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"dest":{"type":"string","description":"Local destination file path"}},"required":["path","dest"]}},
         {"name":"write_file","description":"Write text to a file on the iPhone. Disabled unless the user enables writes in the Hatch window.",
          "inputSchema":{"type":"object","properties":{"udid":dev,"root":root,"path":path,"text":{"type":"string"}},"required":["path","text"]}},
@@ -242,9 +242,10 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
         "download_file" => {
             let u = udid_of(args).await?;
             let dest = args["dest"].as_str().ok_or_else(|| anyhow::anyhow!("dest is required"))?;
-            let (data, _) = device::read_file(&u, &root, path, usize::MAX / 2).await?;
-            tokio::fs::write(dest, &data).await?;
-            Ok(text(format!("saved {} bytes to {dest}", data.len())))
+            // Streams in 1 MiB pieces, so large videos never sit in memory.
+            let t = device::Transfer::default();
+            let n = device::download(&u, &root, &[(path.to_string(), dest.into())], &t).await?;
+            Ok(text(format!("saved {n} bytes to {dest}")))
         }
         "write_file" => {
             write_gate()?;

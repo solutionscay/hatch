@@ -411,3 +411,188 @@ pub async fn delete(udid: &str, root: &Root, path: &str) -> Result<()> {
     with_afc!(udid, root, |c| c.remove_all(path.as_str()).await.map_err(anyhow::Error::from));
     Ok(())
 }
+
+/// Progress and cancel state for one batch of copies. The UI polls it; the copy loop
+/// checks `cancel` between chunks.
+#[derive(Default)]
+pub struct Transfer {
+    pub cancel: std::sync::atomic::AtomicBool,
+    /// Bytes copied in the whole batch.
+    pub done: std::sync::atomic::AtomicU64,
+    /// Bytes in the whole batch.
+    pub total: std::sync::atomic::AtomicU64,
+    /// Files finished.
+    pub files_done: std::sync::atomic::AtomicUsize,
+    /// Name of the file in progress.
+    pub current: std::sync::Mutex<String>,
+}
+
+/// Marks a transfer the user stopped.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+impl Transfer {
+    fn check(&self) -> Result<()> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow::Error::new(Cancelled));
+        }
+        Ok(())
+    }
+
+    fn add(&self, n: u64) {
+        self.done.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn start(&self, name: &str) {
+        *self.current.lock().unwrap() = name.to_string();
+    }
+}
+
+/// AFC moves at most 1 MiB per packet.
+const CHUNK: usize = 1024 * 1024;
+
+fn leaf(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+}
+
+/// Copy one phone file to `dest` in 1 MiB pieces. Writes `dest.part`, then renames it,
+/// so a stopped or failed copy never leaves a short file under the real name.
+async fn copy_out(c: &mut AfcClient, path: &str, dest: &std::path::Path, t: &Transfer) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let info = c.get_file_info(path).await?;
+    if info.st_ifmt == "S_IFDIR" {
+        bail!("{path} is a directory");
+    }
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let mut out = tokio::fs::File::create(&part).await?;
+    let mut f = c.open(path, AfcFopenMode::RdOnly).await?;
+    let mut copied = 0u64;
+    let res: Result<()> = async {
+        loop {
+            t.check()?;
+            let buf = f.read_n(CHUNK).await?;
+            if buf.is_empty() {
+                break;
+            }
+            out.write_all(&buf).await?;
+            copied += buf.len() as u64;
+            t.add(buf.len() as u64);
+        }
+        out.flush().await?;
+        Ok(())
+    }
+    .await;
+    f.close().await.ok();
+    drop(out);
+    match res {
+        Ok(()) => {
+            tokio::fs::rename(&part, dest).await?;
+            Ok(copied)
+        }
+        Err(e) => {
+            tokio::fs::remove_file(&part).await.ok();
+            Err(e)
+        }
+    }
+}
+
+/// Copy phone files (`remote` path, local `dest` file) to this computer, one after another,
+/// on a connection of its own. Stops at the first error or on cancel.
+pub async fn download(udid: &str, root: &Root, files: &[(String, std::path::PathBuf)], t: &Transfer) -> Result<u64> {
+    let mut c = connect(udid, root).await?;
+    let mut total = 0u64;
+    for (remote, _) in files {
+        if let Ok(i) = c.get_file_info(real(root, remote)).await {
+            total += i.size as u64;
+        }
+    }
+    t.total.store(total, std::sync::atomic::Ordering::Relaxed);
+    let mut copied = 0;
+    for (remote, dest) in files {
+        t.check()?;
+        t.start(leaf(remote));
+        copied += copy_out(&mut c, &real(root, remote), dest, t).await?;
+        t.files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(copied)
+}
+
+/// `name`, or `name (2).ext`, `name (3).ext`… whichever `taken` says is free.
+pub fn free_name(name: &str, mut taken: impl FnMut(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    (2..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|c| !taken(c))
+        .expect("an unused name")
+}
+
+/// Copy one local file to the phone path `remote` in 1 MiB pieces. Removes the partial
+/// file on the phone on cancel or error.
+async fn copy_in(c: &mut AfcClient, local: &std::path::Path, remote: &str, t: &Transfer) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let mut src = tokio::fs::File::open(local).await?;
+    let mut f = c.open(remote, AfcFopenMode::WrOnly).await?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut copied = 0u64;
+    let res: Result<()> = async {
+        loop {
+            t.check()?;
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            f.write_entire(&buf[..n]).await?;
+            copied += n as u64;
+            t.add(n as u64);
+        }
+        Ok(())
+    }
+    .await;
+    f.close().await.ok();
+    if let Err(e) = res {
+        c.remove(remote).await.ok();
+        return Err(e);
+    }
+    Ok(copied)
+}
+
+/// Copy local files into the phone folder `dir`. A name that is already there gets a
+/// " (2)" suffix; nothing on the phone is replaced. Returns the phone paths written.
+/// The user always may upload. The MCP "Agent writes" gate does not apply here.
+pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::PathBuf], t: &Transfer) -> Result<Vec<String>> {
+    let mut c = connect(udid, root).await?;
+    let total: u64 = files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    t.total.store(total, std::sync::atomic::Ordering::Relaxed);
+    let rdir = real(root, dir);
+    let mut names: std::collections::HashSet<String> = c.list_dir(rdir.as_str()).await?.into_iter().collect();
+    let mut written = Vec::new();
+    for local in files {
+        t.check()?;
+        let Some(name) = local.file_name().and_then(|n| n.to_str()) else {
+            bail!("{} has a name the iPhone cannot store", local.display());
+        };
+        let name = free_name(name, |n| names.contains(n));
+        t.start(&name);
+        copy_in(&mut c, local, &join(&rdir, &name), t).await?;
+        names.insert(name.clone());
+        written.push(join(dir, &name));
+        t.files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(written)
+}

@@ -28,6 +28,14 @@ The first time, the iPhone must trust this computer:
 - **You tapped Don't Trust.** Unplug the iPhone and connect it again. Then pair again.
 - **No iPhone found.** Use a data cable, not a charge-only cable. Try a different USB port.
 
+## Move files
+
+- Click a file to select it. Ctrl-click adds or removes a file. Shift-click selects a range.
+- Click **Download…** and choose a folder. Hatch copies the files in 1 MB pieces, so large videos work. Click **Cancel** to stop.
+- Drag files from the desktop onto the file view to upload them to the open folder. Drop them on a folder to upload them into that folder.
+- Hatch does not replace files. A name that is already in use gets a number, for example `IMG_0001 (2).JPG`.
+- You can always upload. The **Agent writes** switch controls the agent only.
+
 ## Connect an agent
 
 Hatch runs an MCP server at `http://127.0.0.1:7433/mcp` while the app is open.
