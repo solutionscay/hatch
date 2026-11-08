@@ -1328,8 +1328,9 @@ impl Render for Hatch {
                 .min_w_0()
                 .h_full()
                 .child(toolbar)
-                .children(self.selection_bar(cx))
                 .child(area)
+                // Below the list, so the rows do not move when the first file is picked.
+                .children(self.selection_bar(cx))
                 .children(self.transfer_bar(cx))
                 .into_any_element()
         };

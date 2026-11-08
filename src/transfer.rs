@@ -23,6 +23,15 @@ impl Job {
     }
 }
 
+/// The folder with the home folder shown as ~.
+fn short_path(p: &std::path::Path) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match p.strip_prefix(&home) {
+        Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
+        _ => p.display().to_string(),
+    }
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "file" } else { "files" }
 }
@@ -119,7 +128,7 @@ impl Hatch {
         }
         let t = Arc::new(Transfer::default());
         let count = files.len();
-        let place = dir.display().to_string();
+        let place = short_path(&dir);
         self.job = Some(Job { upload: false, t: t.clone(), count, place: place.clone(), outcome: None });
         self.watch_job(cx);
         let root = self.root.clone();
@@ -229,7 +238,7 @@ impl Hatch {
             })
     }
 
-    /// Bar under the toolbar while files are picked.
+    /// Bar under the file list while files are picked.
     pub fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.picked.is_empty() {
             return None;
@@ -245,7 +254,7 @@ impl Hatch {
                 .px_4()
                 .gap_2()
                 .items_center()
-                .border_b_1()
+                .border_t_1()
                 .border_color(line())
                 .bg(wash())
                 .child(div().text_color(ink()).child(format!("{n} selected")))
@@ -282,7 +291,7 @@ impl Hatch {
                             .min_w_0()
                             .truncate()
                             .text_color(ink())
-                            .child(format!("{verb} {k} of {} to {} · {cur}", j.count, j.place)),
+                            .child(format!("{verb} {k} of {} · {cur} · to {}", j.count, j.place)),
                     )
                     .child(div().flex_none().font_family(mono()).text_size(px(12.)).text_color(dim()).child(format!("{} of {}", human(done), human(total))))
                     .child(self.text_btn("xfer-cancel", if cancelling { "Stopping…" } else { "Cancel" }, false, !cancelling, cx, |t, cx| {
