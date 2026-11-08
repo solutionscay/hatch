@@ -1,6 +1,7 @@
 mod device;
 mod devinfo;
 mod mcp;
+mod transfer;
 
 use device::{App, Device, Entry, Root};
 use gpui_kit::component::{Icon, IconName, Sizable, Theme, ThemeMode, TitleBar, h_flex, v_flex};
@@ -80,6 +81,12 @@ struct Hatch {
     path: String,
     entries: Vec<Entry>,
     selected: Option<String>,
+    /// Files picked for a batch action (download). Names in the current folder.
+    picked: std::collections::BTreeSet<String>,
+    /// Index of the last plain or ctrl click, for shift-click ranges.
+    anchor: Option<usize>,
+    /// The running or last finished transfer.
+    job: Option<transfer::Job>,
     show_log: bool,
     settings: Settings,
     page_settings: bool,
@@ -136,6 +143,9 @@ impl Hatch {
             path: "/".into(),
             entries: vec![],
             selected: None,
+            picked: Default::default(),
+            anchor: None,
+            job: None,
             show_log: false,
             log,
             preview: None,
@@ -391,6 +401,8 @@ impl Hatch {
         self.busy = true;
         self.epoch += 1;
         self.selected = None;
+        self.picked.clear();
+        self.anchor = None;
         self.preview = None;
         self.error = None;
         cx.notify();
@@ -1217,7 +1229,8 @@ impl Render for Hatch {
         } else if self.grid {
             let mut g = div().id("files").size_full().overflow_y_scroll().flex().flex_wrap().content_start();
             for (i, e) in self.entries.iter().cloned().enumerate() {
-                let on = self.selected.as_deref() == Some(&e.name) && !e.is_dir;
+                let on = self.picked.contains(&e.name) && !e.is_dir;
+                let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let thumb = self.thumbs.get(&format!("{}{}", self.root_key(), self.full(&e.name))).cloned();
                 let me = me.clone();
                 let e2 = e.clone();
@@ -1263,9 +1276,10 @@ impl Render for Hatch {
                                 .child(div().truncate().child(if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })),
                         )
                         .hover(|d| d.bg(wash2()))
-                        .on_click(move |_, _, cx| {
-                            let e = e2.clone();
-                            me.update(cx, |this, cx| this.click_entry(e, cx))
+                        .when_some(drop_dir, |d, dir| self.drop_target(d, dir, cx))
+                        .on_click(move |ev, _, cx| {
+                            let (e, m) = (e2.clone(), ev.modifiers());
+                            me.update(cx, |this, cx| this.pick_entry(i, e, m, cx))
                         }),
                 );
             }
@@ -1273,7 +1287,8 @@ impl Render for Hatch {
         } else {
             let mut list = v_flex();
             for (i, e) in self.entries.iter().cloned().enumerate() {
-                let on = self.selected.as_deref() == Some(&e.name) && !e.is_dir;
+                let on = self.picked.contains(&e.name) && !e.is_dir;
+                let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let me = me.clone();
                 let e2 = e.clone();
                 list = list.child(
@@ -1302,9 +1317,10 @@ impl Render for Hatch {
                         .child(div().flex_1().min_w_0().truncate().text_color(ink()).child(e.name.clone()))
                         .child(div().w(px(80.)).flex_none().text_right().font_family(mono()).text_size(px(12.)).text_color(dim()).child(if e.is_dir { String::new() } else { human(e.size) }))
                         .child(div().w(px(140.)).flex_none().text_right().text_size(px(12.)).text_color(faint()).child(e.modified.clone()))
-                        .on_click(move |_, _, cx| {
-                            let e = e2.clone();
-                            me.update(cx, |this, cx| this.click_entry(e, cx))
+                        .when_some(drop_dir, |d, dir| self.drop_target(d, dir, cx))
+                        .on_click(move |ev, _, cx| {
+                            let (e, m) = (e2.clone(), ev.modifiers());
+                            me.update(cx, |this, cx| this.pick_entry(i, e, m, cx))
                         }),
                 );
             }
@@ -1314,7 +1330,19 @@ impl Render for Hatch {
         let main = if self.page_settings {
             self.settings_page(cx).into_any_element()
         } else {
-            v_flex().flex_1().min_w_0().h_full().child(toolbar).child(div().flex_1().min_h_0().child(content)).into_any_element()
+            let here = self.path.clone();
+            let area = div().id("drop-area").flex_1().min_h_0().child(content);
+            let area = if paired && self.error.is_none() { self.drop_target(area, here, cx) } else { area };
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(toolbar)
+                .child(area)
+                // Below the list, so the rows do not move when the first file is picked.
+                .children(self.selection_bar(cx))
+                .children(self.transfer_bar(cx))
+                .into_any_element()
         };
 
         // ---- preview column (flush, full-bleed image)
