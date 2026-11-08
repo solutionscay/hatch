@@ -11,11 +11,72 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub const PORT: u16 = 7433;
+
+fn token_file() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".config/hatch/mcp-token")
+}
+
+/// 64 hex chars (two v4 UUIDs, 244 random bits from the OS RNG).
+fn new_token() -> String {
+    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+}
+
+fn save_token(t: &str) -> anyhow::Result<()> {
+    let p = token_file();
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    std::io::Write::write_all(&mut o.open(&p)?, t.as_bytes())?;
+    Ok(())
+}
+
+/// Read the token from the Hatch config folder. Create it on first launch.
+pub fn load_or_create_token() -> String {
+    if let Ok(t) = std::fs::read_to_string(token_file()) {
+        let t = t.trim();
+        if t.len() >= 32 {
+            return t.to_string();
+        }
+    }
+    let t = new_token();
+    if let Err(e) = save_token(&t) {
+        eprintln!("could not save mcp token: {e:#}");
+    }
+    t
+}
+
+/// Make a new token, save it, and return it. Old clients get 401 at once.
+pub fn rotate_token(slot: &RwLock<String>) -> anyhow::Result<String> {
+    let t = new_token();
+    save_token(&t)?;
+    *slot.write().unwrap() = t.clone();
+    Ok(t)
+}
+
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    let Some(got) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some((scheme, got)) = got.trim().split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let (a, b) = (got.trim().as_bytes(), token.as_bytes());
+    // Constant-time compare.
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -33,6 +94,7 @@ pub struct McpState {
     pub allow_writes: Arc<AtomicBool>,
     pub calls: Arc<AtomicUsize>,
     pub log: Arc<std::sync::Mutex<Vec<LogEntry>>>,
+    pub token: Arc<RwLock<String>>,
 }
 
 pub async fn serve(state: McpState) -> anyhow::Result<()> {
@@ -48,6 +110,9 @@ async fn handle(State(st): State<McpState>, headers: HeaderMap, body: String) ->
         if !(o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost")) {
             return StatusCode::FORBIDDEN.into_response();
         }
+    }
+    if !authorized(&headers, &st.token.read().unwrap()) {
+        return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")], "missing or wrong bearer token\n").into_response();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
