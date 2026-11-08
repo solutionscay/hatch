@@ -264,28 +264,28 @@ pub async fn list_dir(udid: &str, root: &Root, path: &str) -> Result<Vec<Entry>>
     Ok(out)
 }
 
-async fn read_whole(c: &mut AfcClient, path: &str) -> Result<(Vec<u8>, u64)> {
+/// Read at most `max` bytes from the start of the file. Returns the bytes and the file size.
+async fn read_head(c: &mut AfcClient, path: &str, max: usize) -> Result<(Vec<u8>, u64)> {
     let info = c.get_file_info(path).await?;
     if info.st_ifmt == "S_IFDIR" {
         bail!("{path} is a directory");
     }
     let total = info.size as u64;
-    if total > 256 * 1024 * 1024 {
+    // Never ask for more than the file holds: read_n allocates `n` bytes up front.
+    let want = max.min(info.size);
+    if want > 256 * 1024 * 1024 {
         bail!("{path} is {total} bytes. Too large to read in one piece.");
     }
-    // Partial reads (read_n) stall on this iOS version, so read the whole file.
     let mut f = c.open(path, AfcFopenMode::RdOnly).await?;
-    let read = f.read_entire().await;
+    let read = f.read_n(want).await;
     f.close().await.ok();
     Ok((read?, total))
 }
 
-/// Read a file. `max` caps the number of bytes returned.
+/// Read a file. `max` caps the number of bytes read from the phone and returned.
 pub async fn read_file(udid: &str, root: &Root, path: &str, max: usize) -> Result<(Vec<u8>, u64)> {
     let path = real(root, path);
-    let (mut data, total) = with_afc!(udid, root, |c| read_whole(&mut c, &path).await);
-    data.truncate(max);
-    Ok((data, total))
+    Ok(with_afc!(udid, root, |c| read_head(&mut c, &path, max).await))
 }
 
 /// A JPEG preview for a photo or video. Uses the phone's own thumbnail cache for DCIM
