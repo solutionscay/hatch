@@ -618,7 +618,8 @@ impl Hatch {
     }
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut page = v_flex().w_full();
+        // pb_4 matches the pt_4 above each section header, so the last section does not touch the panel edge.
+        let mut page = v_flex().w_full().pb_4();
         page = page.child(section("Locations"));
         page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Choose which locations appear in the sidebar. Hidden locations still work for the agent."));
         page = page.child(self.settings_row(
