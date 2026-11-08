@@ -87,6 +87,10 @@ struct Hatch {
     thumbs: std::collections::HashMap<String, Arc<gpui::Image>>,
     status: String,
     error: Option<String>,
+    /// Set when the usbmuxd socket cannot be reached. Holds the setup steps.
+    mux_down: Option<String>,
+    /// True while the pair request waits for the user on the iPhone.
+    pairing: bool,
     busy: bool,
     allow_writes: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
@@ -131,6 +135,8 @@ impl Hatch {
             thumbs: Default::default(),
             status: "Looking for an iPhone…".into(),
             error,
+            mux_down: None,
+            pairing: false,
             busy: false,
             allow_writes,
             calls,
@@ -142,8 +148,15 @@ impl Hatch {
                 let ok = this
                     .update(cx, |this, cx| {
                         match devices {
-                            Ok(Ok(d)) => this.set_devices(d, cx),
-                            Ok(Err(e)) => this.status = format!("{e:#}"),
+                            Ok(Ok(d)) => {
+                                this.mux_down = None;
+                                this.set_devices(d, cx);
+                            }
+                            Ok(Err(e)) if e.is::<device::MuxDown>() => {
+                                this.mux_down = Some(device::explain(&e));
+                                this.set_devices(vec![], cx);
+                            }
+                            Ok(Err(e)) => this.status = device::explain(&e),
                             Err(_) => {}
                         }
                         cx.notify();
@@ -209,8 +222,10 @@ impl Hatch {
         let Some(udid) = self.udid.clone() else { return };
         self.status = "Unlock the iPhone and tap Trust…".into();
         self.error = None;
+        self.pairing = true;
         cx.notify();
-        run(cx, async move { device::pair(&udid).await.map_err(|e| format!("{e:#}")) }, |this, r, cx| {
+        run(cx, async move { device::pair(&udid).await.map_err(|e| device::explain(&e)) }, |this, r, cx| {
+            this.pairing = false;
             match r {
                 Ok(()) => {
                     this.status = "Paired".into();
@@ -224,7 +239,7 @@ impl Hatch {
 
     fn load_apps(&mut self, cx: &mut Context<Self>) {
         let Some(udid) = self.udid.clone() else { return };
-        run(cx, async move { device::list_apps(&udid).await.map_err(|e| format!("{e:#}")) }, |this, r, cx| {
+        run(cx, async move { device::list_apps(&udid).await.map_err(|e| device::explain(&e)) }, |this, r, cx| {
             match r {
                 Ok(a) => this.apps = a,
                 Err(e) => this.error = Some(format!("Apps: {e}")),
@@ -351,7 +366,7 @@ impl Hatch {
         cx.notify();
         run(
             cx,
-            async move { device::list_dir(&udid, &root, &path).await.map_err(|e| format!("{e:#}")) },
+            async move { device::list_dir(&udid, &root, &path).await.map_err(|e| device::explain(&e)) },
             |this, r, cx| {
                 this.busy = false;
                 match r {
@@ -407,7 +422,7 @@ impl Hatch {
             }
             run(
                 cx,
-                async move { device::preview_image(&udid, &root, &full).await.map_err(|e| format!("{e:#}")) },
+                async move { device::preview_image(&udid, &root, &full).await.map_err(|e| device::explain(&e)) },
                 move |this, r, cx| {
                     if this.selected.as_deref() == Some(&name) {
                         this.preview = Some(match r {
@@ -430,7 +445,7 @@ impl Hatch {
         }
         run(
             cx,
-            async move { device::read_file(&udid, &root, &full, 64 * 1024).await.map_err(|e| format!("{e:#}")) },
+            async move { device::read_file(&udid, &root, &full, 64 * 1024).await.map_err(|e| device::explain(&e)) },
             move |this, r, cx| {
                 if this.selected.as_deref() == Some(&name) {
                     this.preview = Some(Preview::Text(match r {
@@ -888,7 +903,7 @@ impl Render for Hatch {
                 .border_b_1()
                 .border_color(line())
                 .child(div().size(px(36.)).flex_none().bg(wash()).flex().items_center().justify_center().child(Icon::empty().path("icons/smartphone.svg").text_color(faint())))
-                .child(v_flex().child(div().font_weight(FontWeight::SEMIBOLD).child("No iPhone")).child(div().text_size(px(11.)).text_color(dim()).child("Connect a USB cable"))),
+                .child(v_flex().child(div().font_weight(FontWeight::SEMIBOLD).child("No iPhone")).child(div().text_size(px(11.)).text_color(if self.mux_down.is_some() { amb() } else { dim() }).child(if self.mux_down.is_some() { "usbmuxd is not running" } else { "Connect a USB cable" }))),
             Some(d) => h_flex()
                 .h(px(56.))
                 .flex_none()
@@ -1122,10 +1137,14 @@ impl Render for Hatch {
         };
         let content: AnyElement = if let Some(err) = &self.error {
             message(IconName::File, cor(), "Something went wrong", err.clone()).into_any_element()
+        } else if let (None, Some(help)) = (&dev, &self.mux_down) {
+            message(IconName::Info, amb(), "usbmuxd is not running", help.clone()).into_any_element()
         } else if dev.is_none() {
-            message(IconName::Folder, faint(), "No iPhone connected", "Plug in a USB cable and unlock the phone. Hatch finds it automatically.".into()).into_any_element()
+            message(IconName::Folder, faint(), "No iPhone connected", "Connect the iPhone with a USB cable.\nUnlock the iPhone.\nHatch finds it automatically.".into()).into_any_element()
+        } else if self.pairing {
+            message(IconName::Info, amb(), "Look at the iPhone", "1. Unlock the iPhone.\n2. Tap Trust.\n3. Enter the iPhone passcode.\nHatch continues when you finish.".into()).into_any_element()
         } else if !paired {
-            message(IconName::Info, amb(), "Trust this computer", "Tap Trust on the phone when asked, then choose “Trust this computer” in the sidebar.".into()).into_any_element()
+            message(IconName::Info, amb(), "Trust this computer", "The iPhone must trust this computer first.\n1. Unlock the iPhone.\n2. Click Trust this computer in the sidebar.\n3. On the iPhone, tap Trust.\n4. Enter the iPhone passcode.".into()).into_any_element()
         } else if self.entries.is_empty() && !self.busy {
             message(IconName::Folder, faint(), "This folder is empty", format!("{crumb} has no items.")).into_any_element()
         } else if self.grid {

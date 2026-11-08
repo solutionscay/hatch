@@ -1,8 +1,8 @@
 //! iPhone access over USB (usbmuxd + AFC). Every call opens a fresh connection.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use idevice::{
-    IdeviceService,
+    IdeviceError, IdeviceService,
     afc::{AfcClient, opcode::AfcFopenMode},
     house_arrest::HouseArrestClient,
     installation_proxy::InstallationProxyClient,
@@ -57,22 +57,84 @@ fn info_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, D
     C.get_or_init(Default::default)
 }
 
+/// Marks a failure to reach the usbmuxd socket, so the UI can show setup steps.
+#[derive(Debug)]
+pub struct MuxDown;
+
+impl std::fmt::Display for MuxDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&usbmuxd_help())
+    }
+}
+
+impl std::error::Error for MuxDown {}
+
+/// What to do when the usbmuxd socket is not there: install it, or start the service.
+pub fn usbmuxd_help() -> String {
+    let installed = ["/usr/sbin/usbmuxd", "/usr/bin/usbmuxd", "/sbin/usbmuxd", "/usr/local/sbin/usbmuxd"]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
+    if installed {
+        "Hatch cannot reach the usbmuxd service. The service is stopped.\n\
+         Connect the iPhone with a USB cable. The service usually starts by itself.\n\
+         If it does not start, run this command:\n\
+         sudo systemctl start usbmuxd"
+            .into()
+    } else {
+        "Hatch needs the usbmuxd service. It is not installed.\n\
+         Install it with this command:\n\
+         sudo apt install usbmuxd\n\
+         Then connect the iPhone again."
+            .into()
+    }
+}
+
+async fn mux() -> Result<UsbmuxdConnection> {
+    UsbmuxdConnection::default().await.map_err(|_| anyhow::Error::new(MuxDown))
+}
+
+/// Turn an error into a short message that tells the user what to do.
+pub fn explain(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if cause.is::<MuxDown>() {
+            return cause.to_string();
+        }
+        if let Some(ie) = cause.downcast_ref::<IdeviceError>() {
+            match ie {
+                IdeviceError::PasswordProtected | IdeviceError::DeviceLocked => {
+                    return "The iPhone is locked.\nUnlock it with the passcode. Then try again.".into();
+                }
+                IdeviceError::UserDeniedPairing => {
+                    return "The iPhone does not trust this computer.\n\
+                            Unplug the iPhone and connect it again.\n\
+                            Click Trust this computer. Then tap Trust on the iPhone and enter the passcode."
+                        .into();
+                }
+                IdeviceError::PairingDialogResponsePending => {
+                    return "The iPhone shows the Trust dialog.\nTap Trust. Then enter the passcode.".into();
+                }
+                IdeviceError::InvalidHostID => {
+                    return "This computer is not trusted.\nClick Trust this computer in the sidebar.".into();
+                }
+                IdeviceError::DeviceNotFound => {
+                    return "The iPhone is not connected.\nCheck the USB cable. Then connect the iPhone again.".into();
+                }
+                _ => {}
+            }
+        }
+    }
+    format!("{e:#}")
+}
+
 async fn provider_for(udid: &str) -> Result<UsbmuxdProvider> {
     let addr = UsbmuxdAddr::default();
-    let mut mux = UsbmuxdConnection::default()
-        .await
-        .context("cannot reach usbmuxd (is the usbmuxd service running?)")?;
-    let dev = mux
-        .get_device(udid)
-        .await
-        .map_err(|_| anyhow!("device {udid} is not connected"))?;
+    let mut mux = mux().await?;
+    let dev = mux.get_device(udid).await?;
     Ok(dev.to_provider(addr, "hatch"))
 }
 
 pub async fn list_devices() -> Result<Vec<Device>> {
-    let mut mux = UsbmuxdConnection::default()
-        .await
-        .context("cannot reach usbmuxd (is the usbmuxd service running?)")?;
+    let mut mux = mux().await?;
     let devices = mux.get_devices().await?;
     let mut out = Vec::new();
     for d in devices {
@@ -127,7 +189,7 @@ async fn describe(p: &UsbmuxdProvider) -> Result<(String, String, String)> {
 /// Pair with the phone. The phone shows a "Trust This Computer?" dialog.
 pub async fn pair(udid: &str) -> Result<()> {
     let p = provider_for(udid).await?;
-    let mut mux = UsbmuxdConnection::default().await?;
+    let mut mux = mux().await?;
     let buid = mux.get_buid().await?;
     let mut lockdown = LockdownClient::connect(&p).await?;
     let host_id = uuid::Uuid::new_v4().to_string().to_uppercase();
