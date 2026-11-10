@@ -88,7 +88,7 @@ fn field(input: &Entity<InputState>) -> Div {
         .border_color(line())
         .font_family(mono())
         .text_size(px(12.))
-        .child(Input::new(input).appearance(false))
+        .child(Input::new(input).appearance(false).small())
 }
 
 impl Hatch {
@@ -111,7 +111,7 @@ impl Hatch {
             udid: None,
         });
         let input = |v: String, ph: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).placeholder(ph).default_value(v));
-        let name = input(j.name.clone(), "Camera roll", window, cx);
+        let name = input(j.name.clone(), "Job name", window, cx);
         let path = input(j.phone_path.clone(), "/DCIM", window, cx);
         let local = input(j.local.clone(), "~/Pictures/iPhone", window, cx);
         self.sync.edit = Some(Editor {
