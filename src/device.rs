@@ -423,6 +423,8 @@ pub struct Transfer {
     pub total: std::sync::atomic::AtomicU64,
     /// Files finished.
     pub files_done: std::sync::atomic::AtomicUsize,
+    /// Files in the whole batch, when the caller does not know it up front (sync jobs).
+    pub files_total: std::sync::atomic::AtomicUsize,
     /// Name of the file in progress.
     pub current: std::sync::Mutex<String>,
 }
@@ -497,6 +499,13 @@ async fn copy_out(c: &mut AfcClient, path: &str, dest: &std::path::Path, t: &Tra
     match res {
         Ok(()) => {
             tokio::fs::rename(&part, dest).await?;
+            // Keep the phone's modified time, so a later sync sees both copies as equal.
+            if let Some(ns) = info.modified.and_utc().timestamp_nanos_opt() {
+                let when = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns.max(0) as u64);
+                if let Ok(f) = std::fs::File::options().write(true).open(dest) {
+                    f.set_modified(when).ok();
+                }
+            }
             Ok(copied)
         }
         Err(e) => {
@@ -516,7 +525,7 @@ pub async fn download(udid: &str, root: &Root, files: &[(String, std::path::Path
             total += i.size as u64;
         }
     }
-    t.total.store(total, std::sync::atomic::Ordering::Relaxed);
+    t.total.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let mut copied = 0;
     for (remote, dest) in files {
         t.check()?;
@@ -542,12 +551,16 @@ pub fn free_name(name: &str, mut taken: impl FnMut(&str) -> bool) -> String {
         .expect("an unused name")
 }
 
-/// Copy one local file to the phone path `remote` in 1 MiB pieces. Removes the partial
-/// file on the phone on cancel or error.
+/// Copy one local file to the phone path `remote` in 1 MiB pieces. Writes `remote.part`,
+/// then renames it (AFC rename replaces a file under the final name), so a stopped copy or a
+/// pulled cable never leaves a short file under the real name. Sets the phone file's modified
+/// time to the local one. Returns the bytes copied.
 async fn copy_in(c: &mut AfcClient, local: &std::path::Path, remote: &str, t: &Transfer) -> Result<u64> {
     use tokio::io::AsyncReadExt;
     let mut src = tokio::fs::File::open(local).await?;
-    let mut f = c.open(remote, AfcFopenMode::WrOnly).await?;
+    let mtime = src.metadata().await.ok().and_then(|m| m.modified().ok()).and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok());
+    let part = format!("{remote}.part");
+    let mut f = c.open(part.as_str(), AfcFopenMode::WrOnly).await?;
     let mut buf = vec![0u8; CHUNK];
     let mut copied = 0u64;
     let res: Result<()> = async {
@@ -565,9 +578,25 @@ async fn copy_in(c: &mut AfcClient, local: &std::path::Path, remote: &str, t: &T
     }
     .await;
     f.close().await.ok();
+    let res = match res {
+        Ok(()) => match c.rename(part.as_str(), remote).await {
+            Ok(()) => Ok(()),
+            // If AFC will not rename over a file, remove the old file first. The complete
+            // copy is already in place under .part, so this never leaves a short file.
+            Err(_) => {
+                c.remove(remote).await.ok();
+                c.rename(part.as_str(), remote).await.map_err(anyhow::Error::from)
+            }
+        },
+        Err(e) => Err(e),
+    };
     if let Err(e) = res {
-        c.remove(remote).await.ok();
+        c.remove(part.as_str()).await.ok();
         return Err(e);
+    }
+    if let Some(d) = mtime {
+        // Older iOS versions may not support this. The sync state records what the phone reports.
+        c.set_file_time(remote, d.as_nanos() as u64).await.ok();
     }
     Ok(copied)
 }
@@ -578,7 +607,7 @@ async fn copy_in(c: &mut AfcClient, local: &std::path::Path, remote: &str, t: &T
 pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::PathBuf], t: &Transfer) -> Result<Vec<String>> {
     let mut c = connect(udid, root).await?;
     let total: u64 = files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
-    t.total.store(total, std::sync::atomic::Ordering::Relaxed);
+    t.total.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let rdir = real(root, dir);
     let mut names: std::collections::HashSet<String> = c.list_dir(rdir.as_str()).await?.into_iter().collect();
     let mut written = Vec::new();
@@ -597,29 +626,91 @@ pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::Path
     Ok(written)
 }
 
-/// Stream a file from the phone to a local path in 1 MiB pieces. Returns the bytes copied.
-/// Use for large files: `read_file` holds the whole file in memory.
-pub async fn copy_to_local(udid: &str, root: &Root, path: &str, dest: &std::path::Path) -> Result<u64> {
-    use tokio::io::AsyncWriteExt;
-    let path = real(root, path);
+/// Size and modified time (ns since 1970) of one file, as the sync engine compares them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Stat {
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// Raw st_size and st_mtime (ns) from AFC. None for folders and other non-files.
+async fn stat_of(c: &mut AfcClient, path: &str) -> Result<Option<Stat>> {
+    let kv = c.get_file_info_raw(path).await?;
+    if kv.get("st_ifmt").map(String::as_str) != Some("S_IFREG") {
+        return Ok(None);
+    }
+    let size = kv.get("st_size").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mtime = kv.get("st_mtime").and_then(|v| v.parse().ok()).unwrap_or(0);
+    Ok(Some(Stat { size, mtime }))
+}
+
+/// Every file under `dir`, with paths relative to `dir` ("100APPLE/IMG_0001.HEIC").
+/// `skip` gets each file or folder name and leaves it out when it returns true.
+/// A missing `dir` gives an empty list.
+pub async fn walk(udid: &str, root: &Root, dir: &str, skip: fn(&str) -> bool) -> Result<Vec<(String, Stat)>> {
+    let base = real(root, dir);
     Ok(with_afc!(udid, root, |c| {
-        let mut f = c.open(path.as_str(), AfcFopenMode::RdOnly).await?;
-        let r: Result<u64> = async {
-            let mut out = tokio::fs::File::create(dest).await?;
-            let mut n = 0u64;
-            loop {
-                let chunk = f.read_n(1 << 20).await?;
-                if chunk.is_empty() {
-                    break;
+        let mut out = Vec::new();
+        let mut todo = vec![String::new()];
+        let mut first = true;
+        while let Some(rel) = todo.pop() {
+            let full = if rel.is_empty() { base.clone() } else { join(&base, &rel) };
+            let names = match c.list_dir(full.as_str()).await {
+                Ok(n) => n,
+                Err(IdeviceError::Afc(idevice::afc::errors::AfcError::ObjectNotFound)) if first => break,
+                Err(e) => return Err(e.into()),
+            };
+            first = false;
+            for n in names {
+                if n == "." || n == ".." || skip(&n) {
+                    continue;
                 }
-                out.write_all(&chunk).await?;
-                n += chunk.len() as u64;
+                let r = if rel.is_empty() { n.clone() } else { format!("{rel}/{n}") };
+                let kv = c.get_file_info_raw(join(&full, &n)).await?;
+                match kv.get("st_ifmt").map(String::as_str) {
+                    Some("S_IFDIR") => todo.push(r),
+                    Some("S_IFREG") => {
+                        let size = kv.get("st_size").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let mtime = kv.get("st_mtime").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        out.push((r, Stat { size, mtime }));
+                    }
+                    _ => {} // links and other kinds: left out
+                }
             }
-            out.flush().await?;
-            Ok(n)
         }
-        .await;
-        f.close().await.ok();
-        r
+        Ok::<_, anyhow::Error>(out)
     }))
+}
+
+/// Copy local files to exact phone paths (`local`, phone path in the root), one after another,
+/// on a connection of its own. Replaces a file that is already there, through `.part` and a
+/// rename. Makes missing parent folders. Returns the phone size and time of each file written.
+/// Refuses the media partition: sync jobs never write to DCIM or the camera roll.
+pub async fn upload_to(udid: &str, root: &Root, files: &[(std::path::PathBuf, String)], t: &Transfer) -> Result<Vec<Stat>> {
+    if *root == Root::Media {
+        bail!("Hatch does not sync files into the media partition.");
+    }
+    let mut c = connect(udid, root).await?;
+    let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    t.total.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let mut made: std::collections::HashSet<String> = Default::default();
+    let mut out = Vec::new();
+    for (local, remote) in files {
+        t.check()?;
+        let full = real(root, remote);
+        // Make each missing parent folder, top down.
+        let mut parent = String::new();
+        let dirs: Vec<&str> = full.trim_start_matches('/').split('/').collect();
+        for d in &dirs[..dirs.len().saturating_sub(1)] {
+            parent = format!("{parent}/{d}");
+            if made.insert(parent.clone()) {
+                c.mk_dir(parent.as_str()).await.ok();
+            }
+        }
+        t.start(leaf(remote));
+        copy_in(&mut c, local, &full, t).await?;
+        out.push(stat_of(&mut c, &full).await?.unwrap_or(Stat { size: 0, mtime: 0 }));
+        t.files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(out)
 }

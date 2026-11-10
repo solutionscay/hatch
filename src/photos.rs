@@ -83,12 +83,13 @@ impl Snapshot {
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
         b.create(&dir).context("could not make a temp folder for the Photos database")?;
         let snap = Snapshot { db: dir.join("Photos.sqlite"), dir };
-        device::copy_to_local(udid, &Root::Media, DB, &snap.db)
+        let t = device::Transfer::default();
+        device::download(udid, &Root::Media, &[(DB.to_string(), snap.db.clone())], &t)
             .await
             .map_err(|e| db_error(e, "Photos.sqlite"))?;
         for ext in ["-wal", "-shm"] {
             let local = snap.dir.join(format!("Photos.sqlite{ext}"));
-            match device::copy_to_local(udid, &Root::Media, &format!("{DB}{ext}"), &local).await {
+            match device::download(udid, &Root::Media, &[(format!("{DB}{ext}"), local.clone())], &t).await {
                 Ok(_) => {}
                 Err(e) if afc_code(&e) == Some(AfcErrorKind::NotFound) => {
                     let _ = std::fs::remove_file(&local);
