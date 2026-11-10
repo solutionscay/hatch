@@ -204,7 +204,7 @@ fn sync_tools() -> Vec<Value> {
             "description":"List the sync jobs the user saved in Hatch. Each job pairs a folder on the iPhone with a folder on this computer. direction is to_computer or both. writes_phone is true when a run can write to the iPhone.",
             "inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"run_sync_job",
-            "description":"Run a saved sync job by id or name. A job never deletes files. Files changed on both sides are kept twice, and the extra copy gets ' (conflict YYYY-MM-DD)' in its name. A job with writes_phone needs 'Agent writes' on in Hatch. Set preview to true to count what a run would copy, without copying. Agents cannot create or edit jobs.",
+            "description":"Run a saved sync job by id or name. A job never deletes files. Files changed on both sides are kept twice, and the extra copy gets ' (conflict YYYY-MM-DD)' in its name. A job with writes_phone needs 'Agent writes' on in Hatch. Set preview to true to count what a run would copy, without copying. A job that never ran must run once in Hatch first. Agents cannot create or edit jobs.",
             "inputSchema":{"type":"object","properties":{
                 "job":{"type":"string","description":"Job id or name from list_sync_jobs"},
                 "preview":{"type":"boolean","description":"Only count new, changed and conflicting files. Default false."}
@@ -298,6 +298,10 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
             let preview = args["preview"].as_bool().unwrap_or(false);
             if job.writes_phone() && !preview {
                 write_gate()?;
+            }
+            // The first run copies everything and needs the user's preview, as with auto runs.
+            if !preview && crate::sync::load_state(&job.id).is_none() {
+                anyhow::bail!("{} has never run. Ask the user to run it once in Hatch (Settings, Sync), after the preview. Use preview: true to count the files.", job.name);
             }
             // The job's own phone when it is connected, else the first phone.
             let devices = device::list_devices().await?;
