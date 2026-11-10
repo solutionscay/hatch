@@ -140,8 +140,8 @@ async fn handle(State(st): State<McpState>, headers: HeaderMap, body: String) ->
             let mut log = st.log.lock().unwrap();
             log.push(LogEntry {
                 ts: chrono::Local::now().format("%H:%M:%S").to_string(),
-                write: matches!(name.as_str(), "write_file" | "make_dir" | "delete"),
-                path: args["path"].as_str().or(args["dest"].as_str()).unwrap_or("-").to_string(),
+                write: matches!(name.as_str(), "write_file" | "make_dir" | "delete") || (name == "run_sync_job" && !args["preview"].as_bool().unwrap_or(false)),
+                path: args["path"].as_str().or(args["dest"].as_str()).or(args["job"].as_str()).unwrap_or("-").to_string(),
                 tool: name.clone(),
                 ok: res.is_ok(),
                 denied,
@@ -194,7 +194,22 @@ fn tools() -> Value {
     .unwrap_or_default()
     .into_iter()
     .chain(crate::photos::tools())
+    .chain(sync_tools())
     .collect()
+}
+
+fn sync_tools() -> Vec<Value> {
+    vec![
+        json!({"name":"list_sync_jobs",
+            "description":"List the sync jobs the user saved in Hatch. Each job pairs a folder on the iPhone with a folder on this computer. direction is to_computer or both. writes_phone is true when a run can write to the iPhone.",
+            "inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"run_sync_job",
+            "description":"Run a saved sync job by id or name. A job never deletes files. Files changed on both sides are kept twice, and the extra copy gets ' (conflict YYYY-MM-DD)' in its name. A job with writes_phone needs 'Agent writes' on in Hatch. Set preview to true to count what a run would copy, without copying. Agents cannot create or edit jobs.",
+            "inputSchema":{"type":"object","properties":{
+                "job":{"type":"string","description":"Job id or name from list_sync_jobs"},
+                "preview":{"type":"boolean","description":"Only count new, changed and conflicting files. Default false."}
+            },"required":["job"]}}),
+    ]
 }
 
 fn text(s: impl Into<String>) -> Vec<Value> {
@@ -275,6 +290,28 @@ async fn call(st: &McpState, name: &str, args: &Value) -> anyhow::Result<Vec<Val
             write_gate()?;
             device::delete(&udid_of(args).await?, &root, path).await?;
             Ok(text(format!("deleted {path}")))
+        }
+        "list_sync_jobs" => Ok(text(serde_json::to_string_pretty(&crate::sync::list_view())?)),
+        "run_sync_job" => {
+            let key = args["job"].as_str().ok_or_else(|| anyhow::anyhow!("job is required"))?;
+            let job = crate::sync::find(key)?;
+            let preview = args["preview"].as_bool().unwrap_or(false);
+            if job.writes_phone() && !preview {
+                write_gate()?;
+            }
+            // The job's own phone when it is connected, else the first phone.
+            let devices = device::list_devices().await?;
+            let u = match &job.udid {
+                Some(u) if devices.iter().any(|d| &d.udid == u) => u.clone(),
+                _ => udid_of(args).await?,
+            };
+            if preview {
+                let s = crate::sync::preview(&u, &job).await?;
+                return Ok(text(format!("{}\n{}", s.line(), serde_json::to_string_pretty(&s)?)));
+            }
+            let t = device::Transfer::default();
+            let r = crate::sync::run(&u, &job, &t).await?;
+            Ok(text(format!("{}\n{}", r.line(), serde_json::to_string_pretty(&r)?)))
         }
         n if crate::photos::handles(n) => {
             let r = crate::photos::call(&udid_of(args).await?, n, args).await?;

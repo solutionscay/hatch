@@ -16,6 +16,8 @@ pub struct Job {
     pub place: String,
     /// None while the copy runs. Then the message for the user (Ok) or the error (Err).
     pub outcome: Option<Result<String, String>>,
+    /// Name of the sync job, when this is a sync run.
+    pub sync: Option<String>,
 }
 
 impl Job {
@@ -25,7 +27,7 @@ impl Job {
 }
 
 /// The folder with the home folder shown as ~.
-fn short_path(p: &std::path::Path) -> String {
+pub(crate) fn short_path(p: &std::path::Path) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match p.strip_prefix(&home) {
         Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
@@ -34,7 +36,7 @@ fn short_path(p: &std::path::Path) -> String {
 }
 
 /// Style of a bottom-bar button.
-enum Btn {
+pub(crate) enum Btn {
     /// Text only. Fills on hover.
     Quiet,
     /// The one accented action at the right of a bar, with a Lucide icon.
@@ -56,7 +58,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 impl Hatch {
-    fn job_running(&self) -> bool {
+    pub(crate) fn job_running(&self) -> bool {
         self.job.as_ref().is_some_and(Job::running)
     }
 
@@ -126,7 +128,7 @@ impl Hatch {
     fn start_download(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         let Some(udid) = self.udid.clone() else { return };
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.job = Some(Job { upload: false, t: Default::default(), count: 0, place: dir.display().to_string(), outcome: Some(Err(format!("Cannot use {}: {e}", dir.display()))) });
+            self.job = Some(Job { upload: false, t: Default::default(), count: 0, place: dir.display().to_string(), outcome: Some(Err(format!("Cannot use {}: {e}", dir.display()))), sync: None });
             cx.notify();
             return;
         }
@@ -148,7 +150,7 @@ impl Hatch {
         let t = Arc::new(Transfer::default());
         let count = files.len();
         let place = short_path(&dir);
-        self.job = Some(Job { upload: false, t: t.clone(), count, place: place.clone(), outcome: None });
+        self.job = Some(Job { upload: false, t: t.clone(), count, place: place.clone(), outcome: None, sync: None });
         self.watch_job(cx);
         let root = self.root.clone();
         let t2 = t.clone();
@@ -162,6 +164,7 @@ impl Hatch {
             if let Some(j) = &mut this.job {
                 j.outcome = Some(msg);
             }
+            this.next_sync(cx);
             cx.notify();
         });
     }
@@ -179,11 +182,11 @@ impl Hatch {
         let t = Arc::new(Transfer::default());
         let count = files.len();
         if count == 0 {
-            self.job = Some(Job { upload: true, t, count, place, outcome: Some(Err(format!("Nothing to upload.{note}"))) });
+            self.job = Some(Job { upload: true, t, count, place, outcome: Some(Err(format!("Nothing to upload.{note}"))), sync: None });
             cx.notify();
             return;
         }
-        self.job = Some(Job { upload: true, t: t.clone(), count, place: place.clone(), outcome: None });
+        self.job = Some(Job { upload: true, t: t.clone(), count, place: place.clone(), outcome: None, sync: None });
         self.watch_job(cx);
         let (t2, root2, dir2) = (t.clone(), root.clone(), dir.clone());
         run(cx, async move { device::upload(&udid, &root2, &dir2, &files, &t2).await }, move |this, r, cx| {
@@ -196,6 +199,7 @@ impl Hatch {
             if let Some(j) = &mut this.job {
                 j.outcome = Some(msg);
             }
+            this.next_sync(cx);
             // Show the new files if the user still looks at that folder.
             if this.root == root && this.path == dir {
                 this.load_dir(cx);
@@ -205,7 +209,7 @@ impl Hatch {
     }
 
     /// Redraw a few times a second while a copy runs, for the progress bar.
-    fn watch_job(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn watch_job(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
@@ -235,9 +239,9 @@ impl Hatch {
     }
 
     /// Button for the bars under the file view. All have the same height.
-    fn bar_btn(
+    pub(crate) fn bar_btn(
         &self,
-        id: &'static str,
+        id: impl Into<ElementId>,
         label: &str,
         kind: Btn,
         enabled: bool,
@@ -245,36 +249,11 @@ impl Hatch {
         f: impl Fn(&mut Hatch, &mut Context<Hatch>) + 'static,
     ) -> Stateful<Div> {
         let me = cx.entity();
-        let (primary, icon) = match kind {
-            Btn::Quiet => (false, None),
-            Btn::Primary(icon) => (true, Some(icon)),
-        };
-        div()
-            .id(id)
-            .h(px(28.))
-            .px_3()
-            .gap_1p5()
-            .flex()
-            .flex_none()
-            .items_center()
-            .text_size(px(12.))
-            .text_color(if !enabled { faint() } else if primary { acc() } else { dim() })
-            .when(primary, |d| {
-                d.border_1()
-                    .border_color(if enabled { rgba(0x5fd4a057) } else { line() })
-                    .bg(if enabled { acc_s() } else { wash() })
-                    .font_weight(FontWeight::MEDIUM)
-            })
-            .when(enabled, |d| {
-                d.cursor_pointer().hover(move |d| if primary { d.bg(rgba(0x5fd4a033)) } else { d.bg(wash()).text_color(ink()) })
-            })
-            .when_some(icon, |d, p| d.child(Icon::empty().path(p).small()))
-            .child(label.to_string())
-            .on_click(move |_, _, cx| {
-                if enabled {
-                    me.update(cx, |this, cx| f(this, cx))
-                }
-            })
+        bar_btn_look(id, label, kind, enabled).on_click(move |_, _, cx| {
+            if enabled {
+                me.update(cx, |this, cx| f(this, cx))
+            }
+        })
     }
 
     /// Bar under the file list while files are picked.
@@ -319,19 +298,23 @@ impl Hatch {
         let row = bar_row();
         let row = match &j.outcome {
             None => {
-                let k = (j.t.files_done.load(Ordering::Relaxed) + 1).min(j.count);
+                let count = j.count.max(j.t.files_total.load(Ordering::Relaxed));
+                let k = (j.t.files_done.load(Ordering::Relaxed) + 1).min(count);
                 let cur = j.t.current.lock().unwrap().clone();
                 let verb = if j.upload { "Uploading" } else { "Downloading" };
                 let cancelling = j.t.cancel.load(Ordering::Relaxed);
-                row.child(Icon::new(if j.upload { IconName::ArrowUp } else { IconName::ArrowDown }).small().text_color(acc()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(ink())
-                            .child(format!("{verb} {k} of {} · {cur} · to {}", j.count, j.place)),
-                    )
+                let text = match &j.sync {
+                    Some(name) if count == 0 => format!("Syncing {name} · comparing files…"),
+                    Some(name) => format!("Syncing {name} · {k} of {count} · {cur}"),
+                    None => format!("{verb} {k} of {count} · {cur} · to {}", j.place),
+                };
+                let icon = match (&j.sync, j.upload) {
+                    (Some(_), _) => Icon::empty().path("icons/refresh-cw.svg"),
+                    (None, true) => Icon::new(IconName::ArrowUp),
+                    (None, false) => Icon::new(IconName::ArrowDown),
+                };
+                row.child(icon.small().text_color(acc()))
+                    .child(div().flex_1().min_w_0().truncate().text_color(ink()).child(text))
                     .child(div().flex_none().text_color(dim()).child(format!("{} of {}", human(done), human(total))))
                     .child(self.bar_btn("xfer-cancel", if cancelling { "Stopping…" } else { "Cancel" }, Btn::Quiet, !cancelling, cx, |t, cx| {
                         if let Some(j) = &t.job {
@@ -360,4 +343,31 @@ impl Hatch {
         }
         Some(bar.into_any_element())
     }
+}
+
+/// Look of a bar button, with no click handler.
+pub(crate) fn bar_btn_look(id: impl Into<ElementId>, label: &str, kind: Btn, enabled: bool) -> Stateful<Div> {
+    let (primary, icon) = match kind {
+        Btn::Quiet => (false, None),
+        Btn::Primary(icon) => (true, Some(icon)),
+    };
+    div()
+        .id(id)
+        .h(px(28.))
+        .px_3()
+        .gap_1p5()
+        .flex()
+        .flex_none()
+        .items_center()
+        .text_size(px(12.))
+        .text_color(if !enabled { faint() } else if primary { acc() } else { dim() })
+        .when(primary, |d| {
+            d.border_1()
+                .border_color(if enabled { rgba(0x5fd4a057) } else { line() })
+                .bg(if enabled { acc_s() } else { wash() })
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(enabled, |d| d.cursor_pointer().hover(move |d| if primary { d.bg(rgba(0x5fd4a033)) } else { d.bg(wash()).text_color(ink()) }))
+        .when_some(icon, |d, p| d.child(Icon::empty().path(p).small()))
+        .child(label.to_string())
 }
