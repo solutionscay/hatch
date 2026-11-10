@@ -3,6 +3,8 @@ mod devinfo;
 mod mcp;
 mod transfer;
 mod photos;
+mod sync;
+mod sync_ui;
 
 use device::{App, Device, Entry, Root};
 use gpui_kit::component::{Icon, IconName, Sizable, Theme, ThemeMode, TitleBar, h_flex, v_flex};
@@ -113,6 +115,8 @@ struct Hatch {
     token: Arc<std::sync::RwLock<String>>,
     /// Focus for the whole window, so Escape works without a click first.
     focus: FocusHandle,
+    /// Sync jobs, the job editor, and the auto-run queue.
+    sync: sync_ui::SyncUi,
 }
 
 impl Hatch {
@@ -167,6 +171,7 @@ impl Hatch {
             calls,
             token,
             focus: cx.focus_handle(),
+            sync: sync_ui::SyncUi::load(),
         };
         Self::start_info_poll(cx);
         // Poll for devices and keep the call counter fresh.
@@ -238,6 +243,13 @@ impl Hatch {
             if self.current().is_some_and(|d| d.paired) {
                 self.open_root(Root::Media, cx);
                 self.load_apps(cx);
+            }
+            // Plug-in: run the auto sync jobs of each trusted phone that just appeared.
+            if first_seen {
+                let trusted: Vec<String> = self.devices.iter().filter(|d| d.paired).map(|d| d.udid.clone()).collect();
+                for u in trusted {
+                    self.queue_auto_sync(&u, cx);
+                }
             }
         }
     }
@@ -739,6 +751,8 @@ impl Hatch {
         if self.apps.is_empty() {
             page = page.child(div().px_6().py_3().text_size(px(12.)).text_color(faint()).child("App folders appear here once an iPhone is connected and trusted."));
         }
+        page = page.child(section("Sync"));
+        page = page.child(self.sync_section(cx));
         page = page.child(section("Browsing"));
         page = page.child(self.settings_row(
             "set-grid".into(),
@@ -879,6 +893,8 @@ impl Hatch {
                     })),
             )
             .child(div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().child(page))
+            // Sync runs started here show their progress here too.
+            .children(self.transfer_bar(cx))
     }
 
     fn nav_item(
@@ -958,6 +974,10 @@ impl Hatch {
     fn close_top(&mut self, _: &CloseTop, _: &mut Window, cx: &mut Context<Self>) {
         if self.show_log {
             self.show_log = false;
+        } else if self.page_settings && (self.sync.edit.is_some() || self.sync.preview.is_some() || self.sync.confirm.is_some()) {
+            self.sync.edit = None;
+            self.sync.preview = None;
+            self.sync.confirm = None;
         } else if self.page_settings {
             self.page_settings = false;
         } else if self.selected.is_some() || self.preview.is_some() {
