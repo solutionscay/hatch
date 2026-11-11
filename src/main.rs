@@ -643,11 +643,45 @@ struct Settings {
     start_in_grid: bool,
     /// Hide folders with no entries in the file list and grid.
     hide_empty: bool,
+    /// The Settings tab shown last. Settings opens on it.
+    tab: SettingsTab,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SettingsTab {
+    #[default]
+    General,
+    Device,
+    Sync,
+    Agents,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 4] = [SettingsTab::General, SettingsTab::Device, SettingsTab::Sync, SettingsTab::Agents];
+
+    fn key(self) -> &'static str {
+        match self {
+            SettingsTab::General => "general",
+            SettingsTab::Device => "device",
+            SettingsTab::Sync => "sync",
+            SettingsTab::Agents => "agents",
+        }
+    }
+
+    fn label_icon(self) -> (&'static str, &'static str) {
+        match self {
+            SettingsTab::General => ("General", "icons/settings-2.svg"),
+            SettingsTab::Device => ("Device", "icons/smartphone.svg"),
+            SettingsTab::Sync => ("Sync", "icons/folder-sync.svg"),
+            SettingsTab::Agents => ("Agents", "icons/bot.svg"),
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { hidden: vec![], start_in_grid: false, hide_empty: true }
+        Self { hidden: vec![], start_in_grid: false, hide_empty: true, tab: SettingsTab::General }
     }
 }
 
@@ -836,39 +870,79 @@ impl Hatch {
             })
     }
 
+    /// One row of the Settings tab list. Same look as the sidebar rows.
+    fn settings_tab(&self, tab: SettingsTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.settings.tab == tab;
+        let (label, icon) = tab.label_icon();
+        h_flex()
+            .id(SharedString::from(format!("tab-{label}")))
+            .h(px(32.))
+            .px_4()
+            .gap_2()
+            .items_center()
+            .cursor_pointer()
+            .border_l_2()
+            .border_color(if active { acc() } else { none() })
+            .text_color(if active { ink() } else { dim() })
+            .when(active, |d| d.bg(acc_s()))
+            .hover(|d| d.bg(wash()).text_color(ink()))
+            .child(Icon::empty().path(icon).small().text_color(if active { acc() } else { faint() }))
+            .child(div().flex_1().truncate().child(label))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.settings.tab != tab {
+                    this.settings.tab = tab;
+                    save_settings(&this.settings);
+                    cx.notify();
+                }
+            }))
+    }
+
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = self.settings.tab;
         // pb_4 matches the pt_4 above each section header, so the last section does not touch the panel edge.
-        let mut page = v_flex().w_full().pb_4();
-        page = page.child(section("Device"));
-        page = page.child(self.device_section(cx));
-        page = page.child(section("Locations"));
-        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Choose which locations appear in the sidebar. Hidden locations still work for the agent."));
-        page = page.child(self.settings_row(
-            "set-media".into(),
-            IconName::Folder,
-            "Media (all)".into(),
-            Some("/var/mobile/Media".into()),
-            self.location_visible("media"),
-            cx,
-            |this, v, cx| this.set_location_visible("media", v, cx),
-        ));
-        for a in self.apps.clone() {
-            let key = a.bundle_id.clone();
-            page = page.child(self.settings_row(
-                format!("set-{key}"),
-                IconName::Folder,
-                a.name.clone(),
-                Some(a.bundle_id.clone()),
-                self.location_visible(&a.bundle_id),
-                cx,
-                move |this, v, cx| this.set_location_visible(&key, v, cx),
-            ));
+        let page = v_flex().w_full().pb_4();
+        let page = match tab {
+            SettingsTab::General => self.general_page(page, cx),
+            SettingsTab::Device => page.child(section("Device")).child(self.device_section(cx)),
+            SettingsTab::Sync => page.child(section("Sync jobs")).child(self.sync_section(cx)),
+            SettingsTab::Agents => self.agents_page(page, cx),
+        };
+        let mut tabs = v_flex().w(px(184.)).h_full().flex_none().pt_2().border_r_1().border_color(line());
+        for t in SettingsTab::ALL {
+            tabs = tabs.child(self.settings_tab(t, cx));
         }
-        if self.apps.is_empty() {
-            page = page.child(div().px_6().py_3().text_size(px(12.)).text_color(faint()).child("App folders appear here once an iPhone is connected and trusted."));
-        }
-        page = page.child(section("Sync"));
-        page = page.child(self.sync_section(cx));
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                h_flex()
+                    .h(px(56.))
+                    .flex_none()
+                    .px_6()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(line())
+                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
+                    .child(self.icon_btn("settings-close", IconName::Close, false, true, cx, |t, cx| {
+                        t.page_settings = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(tabs)
+                    // One id per tab, so each page keeps its own scroll position.
+                    .child(div().id(SharedString::from(format!("settings-scroll-{}", tab.key()))).flex_1().min_w_0().h_full().overflow_y_scroll().child(page)),
+            )
+            // Sync runs started here show their progress here too.
+            .children(self.transfer_bar(cx))
+    }
+
+    fn general_page(&self, mut page: Div, cx: &mut Context<Self>) -> Div {
         page = page.child(section("Browsing"));
         page = page.child(self.settings_row(
             "set-grid".into(),
@@ -897,80 +971,88 @@ impl Hatch {
                 cx.notify();
             },
         ));
-        page = page.child(section("Connect an agent"));
-        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Hatch must be running. Run one of these once, then ask your agent to list the iPhone's files. Each command holds the access token. After you rotate the token, run the command again."));
+        page = page.child(section("Locations"));
+        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Choose which locations appear in the sidebar. Hidden locations still work for the agent."));
+        page = page.child(self.settings_row(
+            "set-media".into(),
+            IconName::Folder,
+            "Media (all)".into(),
+            Some("/var/mobile/Media".into()),
+            self.location_visible("media"),
+            cx,
+            |this, v, cx| this.set_location_visible("media", v, cx),
+        ));
+        for a in self.apps.clone() {
+            let key = a.bundle_id.clone();
+            page = page.child(self.settings_row(
+                format!("set-{key}"),
+                IconName::Folder,
+                a.name.clone(),
+                Some(a.bundle_id.clone()),
+                self.location_visible(&a.bundle_id),
+                cx,
+                move |this, v, cx| this.set_location_visible(&key, v, cx),
+            ));
+        }
+        if self.apps.is_empty() {
+            page = page.child(div().px_6().py_3().text_size(px(12.)).text_color(faint()).child("App folders appear here once an iPhone is connected and trusted."));
+        }
+        page
+    }
+
+    /// A copyable snippet: label, buttons, and the text in a mono box.
+    fn snippet(&self, id: &'static str, label: &'static str, text: String, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .px_6()
+            .py_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(line())
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_color(ink()).child(label))
+                    .child(h_flex().gap_2().when(id == "token", |d| {
+                        let me = cx.entity();
+                        let rotated = self.copied.as_deref() == Some("rotated");
+                        d.child(
+                            div()
+                                .id("rotate-token")
+                                .h(px(26.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(if rotated { rgba(0x5fd4a057) } else { line() })
+                                .bg(if rotated { acc_s() } else { wash() })
+                                .text_size(px(12.))
+                                .text_color(if rotated { acc() } else { dim() })
+                                .hover(|d| d.bg(wash2()))
+                                .child(if rotated { "Rotated" } else { "Rotate" })
+                                .on_click(move |_, _, cx| me.update(cx, |this, cx| this.rotate_token(cx))),
+                        )
+                    }).child(self.copy_btn(id, text.clone(), cx))),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .bg(rgba(0x00000033))
+                    .border_1()
+                    .border_color(line())
+                    .font_family(mono())
+                    .text_size(px(11.))
+                    .text_color(dim())
+                    .child(text),
+            )
+    }
+
+    fn agents_page(&self, mut page: Div, cx: &mut Context<Self>) -> Div {
         let url = format!("http://127.0.0.1:{}/mcp", mcp::PORT);
         let token = self.token.read().unwrap().clone();
-        let auth = format!("Authorization: Bearer {token}");
-        let codex_cfg = "\"${CODEX_HOME:-$HOME/.codex}/config.toml\"";
-        let snippets: Vec<(&str, &str, String)> = vec![
-            ("cc", "Claude Code", format!("claude mcp remove hatch >/dev/null 2>&1; claude mcp add --transport http hatch {url} --header \"{auth}\"")),
-            (
-                "codex",
-                "Codex",
-                format!("codex mcp remove hatch >/dev/null 2>&1; printf '\\n[mcp_servers.hatch]\\nurl = \"{url}\"\\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\\n' >> {codex_cfg}"),
-            ),
-            ("gemini", "Gemini CLI", format!("gemini mcp add --scope user --transport http hatch {url} --header \"{auth}\"")),
-            ("agy", "Antigravity (agy)", format!("agy mcp add --header \"{auth}\" hatch {url}")),
-            ("grok", "Grok", format!("grok mcp add --transport http hatch {url} --header \"{auth}\"")),
-            (
-                "json",
-                "Other clients (JSON)",
-                format!("{{\"mcpServers\":{{\"hatch\":{{\"type\":\"http\",\"url\":\"{url}\",\"headers\":{{\"Authorization\":\"Bearer {token}\"}}}}}}}}"),
-            ),
-            ("url", "Endpoint URL", url.clone()),
-            ("token", "Access token", token.clone()),
-        ];
-        for (id, label, text) in snippets {
-            page = page.child(
-                v_flex()
-                    .px_6()
-                    .py_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(div().text_color(ink()).child(label))
-                            .child(h_flex().gap_2().when(id == "token", |d| {
-                                let me = cx.entity();
-                                let rotated = self.copied.as_deref() == Some("rotated");
-                                d.child(
-                                    div()
-                                        .id("rotate-token")
-                                        .h(px(26.))
-                                        .px_3()
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .border_1()
-                                        .border_color(if rotated { rgba(0x5fd4a057) } else { line() })
-                                        .bg(if rotated { acc_s() } else { wash() })
-                                        .text_size(px(12.))
-                                        .text_color(if rotated { acc() } else { dim() })
-                                        .hover(|d| d.bg(wash2()))
-                                        .child(if rotated { "Rotated" } else { "Rotate" })
-                                        .on_click(move |_, _, cx| me.update(cx, |this, cx| this.rotate_token(cx))),
-                                )
-                            }).child(self.copy_btn(id, text.clone(), cx))),
-                    )
-                    .child(
-                        div()
-                            .p_2()
-                            .bg(rgba(0x00000033))
-                            .border_1()
-                            .border_color(line())
-                            .font_family(mono())
-                            .text_size(px(11.))
-                            .text_color(dim())
-                            .child(text),
-                    ),
-            );
-        }
-        page = page.child(section("Agent"));
         let writes = self.allow_writes.load(Ordering::Relaxed);
+        page = page.child(section("Agent"));
         page = page.child(
             h_flex()
                 .h(px(52.))
@@ -983,9 +1065,11 @@ impl Hatch {
                 .child(
                     v_flex()
                         .flex_1()
+                        .min_w_0()
                         .child(div().text_color(ink()).child("MCP endpoint"))
-                        .child(div().font_family(mono()).text_size(px(11.)).text_color(faint()).child(format!("http://127.0.0.1:{}/mcp", mcp::PORT))),
-                ),
+                        .child(div().font_family(mono()).text_size(px(11.)).text_color(faint()).child(url.clone())),
+                )
+                .child(self.copy_btn("url", url.clone(), cx)),
         );
         page = page.child(
             h_flex()
@@ -1003,28 +1087,31 @@ impl Hatch {
                         .child(div().text_size(px(11.)).text_color(if writes { amb() } else { faint() }).child(if writes { "Allowed this session. Always off at launch." } else { "Read only. Always off at launch." })),
                 ),
         );
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child(
-                h_flex()
-                    .h(px(56.))
-                    .flex_none()
-                    .px_6()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(line())
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-                    .child(self.icon_btn("settings-close", IconName::Close, false, true, cx, |t, cx| {
-                        t.page_settings = false;
-                        cx.notify();
-                    })),
-            )
-            .child(div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll().child(page))
-            // Sync runs started here show their progress here too.
-            .children(self.transfer_bar(cx))
+        page = page.child(self.snippet("token", "Access token", token.clone(), cx));
+        page = page.child(section("Connect an agent"));
+        page = page.child(div().px_6().pb_3().text_size(px(12.)).text_color(dim()).child("Hatch must be running. Run one of these once, then ask your agent to list the iPhone's files. Each command holds the access token. After you rotate the token, run the command again."));
+        let auth = format!("Authorization: Bearer {token}");
+        let codex_cfg = "\"${CODEX_HOME:-$HOME/.codex}/config.toml\"";
+        let snippets: Vec<(&'static str, &'static str, String)> = vec![
+            ("cc", "Claude Code", format!("claude mcp remove hatch >/dev/null 2>&1; claude mcp add --transport http hatch {url} --header \"{auth}\"")),
+            (
+                "codex",
+                "Codex",
+                format!("codex mcp remove hatch >/dev/null 2>&1; printf '\\n[mcp_servers.hatch]\\nurl = \"{url}\"\\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\\n' >> {codex_cfg}"),
+            ),
+            ("gemini", "Gemini CLI", format!("gemini mcp add --scope user --transport http hatch {url} --header \"{auth}\"")),
+            ("agy", "Antigravity (agy)", format!("agy mcp add --header \"{auth}\" hatch {url}")),
+            ("grok", "Grok", format!("grok mcp add --transport http hatch {url} --header \"{auth}\"")),
+            (
+                "json",
+                "Other clients (JSON)",
+                format!("{{\"mcpServers\":{{\"hatch\":{{\"type\":\"http\",\"url\":\"{url}\",\"headers\":{{\"Authorization\":\"Bearer {token}\"}}}}}}}}"),
+            ),
+        ];
+        for (id, label, text) in snippets {
+            page = page.child(self.snippet(id, label, text, cx));
+        }
+        page
     }
 
     fn nav_item(
@@ -1248,6 +1335,8 @@ impl Render for Hatch {
                         .child(format!("{hidden_n} hidden · manage in Settings"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.page_settings = true;
+                            this.settings.tab = SettingsTab::General;
+                            save_settings(&this.settings);
                             cx.notify();
                         })),
                 );
