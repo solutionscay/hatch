@@ -117,8 +117,6 @@ struct Hatch {
     focus: FocusHandle,
     /// Sync jobs, the job editor, and the auto-run queue.
     sync: sync_ui::SyncUi,
-    /// Root key + path of the folder where the user clicked "Show" for empty folders.
-    show_empty_at: Option<String>,
     /// Bumped on each folder load; a running emptiness check stops when it changes.
     fill_epoch: u64,
     /// Scroll state of the file list and grid.
@@ -221,7 +219,6 @@ impl Hatch {
             token,
             focus: cx.focus_handle(),
             sync: sync_ui::SyncUi::load(),
-            show_empty_at: None,
             fill_epoch: 0,
             files_scroll: ScrollHandle::new(),
             spots: Default::default(),
@@ -490,9 +487,6 @@ impl Hatch {
         self.busy = true;
         self.epoch += 1;
         self.fill_epoch += 1;
-        if self.show_empty_at.as_deref() != Some(self.here_key().as_str()) {
-            self.show_empty_at = None;
-        }
         self.selected = None;
         self.picked.clear();
         self.anchor = None;
@@ -568,10 +562,6 @@ impl Hatch {
             device::forget_children(&u, &self.root, &self.path);
         }
         self.load_dir(cx);
-    }
-
-    fn here_key(&self) -> String {
-        format!("{}{}", self.root_key(), self.path)
     }
 
     /// In the background, list each unchecked subfolder of the open folder (up to FILL_CAP)
@@ -1209,16 +1199,12 @@ impl Hatch {
         icon: IconName,
         active: bool,
         starred: bool,
-        hide_key: Option<String>,
         on: impl Fn(&mut Hatch, &mut Context<Hatch>) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let me = cx.entity();
-        let group = SharedString::from(format!("g-{id}"));
-        let me_h = me.clone();
         h_flex()
-            .group(group.clone())
-            .id(SharedString::from(id.clone()))
+            .id(SharedString::from(id))
             .h(px(32.))
             .px_4()
             .gap_2()
@@ -1231,24 +1217,6 @@ impl Hatch {
             .hover(|d| d.bg(wash()).text_color(ink()))
             .child(Icon::new(icon).small().text_color(if active || starred { acc() } else { faint() }))
             .child(div().flex_1().truncate().child(label))
-            .when_some(hide_key, |d, key| {
-                d.child(
-                    div()
-                        .id(SharedString::from(format!("hide-{id}")))
-                        .invisible()
-                        .group_hover(group.clone(), |s| s.visible())
-                        .size(px(22.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|d| d.bg(wash2()))
-                        .child(Icon::new(IconName::EyeOff).xsmall().text_color(faint()))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            me_h.update(cx, |this, cx| this.set_location_visible(&key, false, cx));
-                        }),
-                )
-            })
             .on_click(move |_, _, cx| me.update(cx, |this, cx| on(this, cx)))
     }
 
@@ -1394,12 +1362,12 @@ impl Render for Hatch {
                 for (i, f) in self.favs.iter().cloned().enumerate() {
                     let active = !self.page_settings && self.root_str() == f.root && self.path == f.path;
                     let f2 = f.clone();
-                    nav = nav.child(self.nav_item(format!("fav-{i}"), f.label.clone(), IconName::Star, active, true, None, move |this, cx| this.open_fav(f2.clone(), cx), cx));
+                    nav = nav.child(self.nav_item(format!("fav-{i}"), f.label.clone(), IconName::Star, active, true, move |this, cx| this.open_fav(f2.clone(), cx), cx));
                 }
             }
             nav = nav.child(section("Locations"));
             if self.location_visible("media") {
-                nav = nav.child(self.nav_item("loc-media".into(), "Media (all)".into(), IconName::Folder, !self.page_settings && self.root == Root::Media && self.path == "/", false, Some("media".into()), |this, cx| this.open_root(Root::Media, cx), cx));
+                nav = nav.child(self.nav_item("loc-media".into(), "Media (all)".into(), IconName::Folder, !self.page_settings && self.root == Root::Media && self.path == "/", false, |this, cx| this.open_root(Root::Media, cx), cx));
             }
             for a in self.apps.clone() {
                 if !self.location_visible(&a.bundle_id) {
@@ -1407,27 +1375,7 @@ impl Render for Hatch {
                 }
                 let r = Root::App(a.bundle_id.clone());
                 let active = !self.page_settings && self.root == r && self.path == "/";
-                nav = nav.child(self.nav_item(format!("loc-{}", a.bundle_id), a.name.clone(), IconName::Folder, active, false, Some(a.bundle_id.clone()), move |this, cx| this.open_root(r.clone(), cx), cx));
-            }
-            let hidden_n = self.settings.hidden.len();
-            if hidden_n > 0 {
-                nav = nav.child(
-                    div()
-                        .id("hidden-note")
-                        .px_4()
-                        .py_2()
-                        .text_size(px(11.))
-                        .text_color(faint())
-                        .cursor_pointer()
-                        .hover(|d| d.text_color(dim()))
-                        .child(format!("{hidden_n} hidden · manage in Settings"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page_settings = true;
-                            this.settings.tab = SettingsTab::General;
-                            save_settings(&this.settings);
-                            cx.notify();
-                        })),
-                );
+                nav = nav.child(self.nav_item(format!("loc-{}", a.bundle_id), a.name.clone(), IconName::Folder, active, false, move |this, cx| this.open_root(r.clone(), cx), cx));
             }
             side = side.child(div().id("nav").flex_1().min_h_0().overflow_y_scroll().child(nav));
         } else {
@@ -1441,7 +1389,6 @@ impl Render for Hatch {
                 IconName::Settings2,
                 settings_on,
                 false,
-                None,
                 |this, cx| {
                     this.page_settings = !this.page_settings;
                     cx.notify();
@@ -1499,36 +1446,8 @@ impl Render for Hatch {
                     .child(div().font_family(mono()).child(format!("127.0.0.1:{} · {} calls", mcp::PORT, calls))),
             );
 
-        // ---- empty folders hidden in this folder
-        let empty_set = self.hidden_empty();
-        let showing_empty = self.show_empty_at.as_deref() == Some(self.here_key().as_str());
-        let skip: std::collections::HashSet<usize> = if showing_empty { Default::default() } else { empty_set.clone() };
-        let empty_note: Option<AnyElement> = (!empty_set.is_empty()).then(|| {
-            let n = empty_set.len();
-            let what = if n == 1 { "empty folder" } else { "empty folders" };
-            h_flex()
-                .flex_none()
-                .px_4()
-                .py_3()
-                .w_full()
-                .gap_1()
-                .text_size(px(12.))
-                .text_color(faint())
-                .child(format!("{n} {what} {} ·", if showing_empty { "shown" } else { "hidden" }))
-                .child(
-                    div()
-                        .id("empty-toggle")
-                        .cursor_pointer()
-                        .text_color(acc())
-                        .hover(|d| d.underline())
-                        .child(if showing_empty { "Hide" } else { "Show" })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.show_empty_at = if showing_empty { None } else { Some(this.here_key()) };
-                            cx.notify();
-                        })),
-                )
-                .into_any_element()
-        });
+        // ---- empty folders hidden by the Settings switch
+        let skip = self.hidden_empty();
 
         // ---- toolbar
         let (fav_root, fav_path) = (self.root_str(), self.path.clone());
@@ -1685,7 +1604,7 @@ impl Render for Hatch {
                         }),
                 );
             }
-            g.children(empty_note).into_any_element()
+            g.into_any_element()
         } else {
             // Rows are direct children of the scroll box, so the scroll handle can find them.
             let mut list = v_flex().id("files").size_full().overflow_y_scroll().track_scroll(&self.files_scroll);
@@ -1731,7 +1650,7 @@ impl Render for Hatch {
                         }),
                 );
             }
-            list.children(empty_note).into_any_element()
+            list.into_any_element()
         };
 
         let main = if self.page_settings {
