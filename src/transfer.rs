@@ -65,6 +65,7 @@ impl Hatch {
     /// Click on a row or tile. Plain click picks one file and previews it, or opens a folder.
     /// Ctrl-click adds or removes a file. Shift-click picks the files between the anchor and here.
     pub fn pick_entry(&mut self, i: usize, e: Entry, m: Modifiers, cx: &mut Context<Self>) {
+        self.came_from = None;
         let toggle = m.control || m.platform;
         if e.is_dir && !toggle && !m.shift {
             self.click_entry(e, cx);

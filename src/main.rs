@@ -121,6 +121,40 @@ struct Hatch {
     show_empty_at: Option<String>,
     /// Bumped on each folder load; a running emptiness check stops when it changes.
     fill_epoch: u64,
+    /// Scroll state of the file list and grid.
+    files_scroll: ScrollHandle,
+    /// Scroll offset and clicked entry per folder (udid|root:path). Session only.
+    spots: std::collections::HashMap<String, Spot>,
+    /// The folder whose listing is on screen: udid, root, path.
+    shown: Option<(String, Root, String)>,
+    /// The folder the user clicked to go in, set until the next folder load.
+    enter_from: Option<String>,
+    /// The entry marked after going back: the folder the user came out of.
+    came_from: Option<String>,
+}
+
+/// Where the user was in a folder when they left it.
+struct Spot {
+    y: Pixels,
+    entry: Option<String>,
+    names: u64,
+    grid: bool,
+}
+
+fn spot_key(udid: &str, root: &Root, path: &str) -> String {
+    match root {
+        Root::Media => format!("{udid}|media:{path}"),
+        Root::App(id) => format!("{udid}|{id}:{path}"),
+    }
+}
+
+fn names_hash(entries: &[Entry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for e in entries {
+        e.name.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Only the first this many subfolders of a folder are checked. The rest stay visible.
@@ -189,6 +223,11 @@ impl Hatch {
             sync: sync_ui::SyncUi::load(),
             show_empty_at: None,
             fill_epoch: 0,
+            files_scroll: ScrollHandle::new(),
+            spots: Default::default(),
+            shown: None,
+            enter_from: None,
+            came_from: None,
         };
         Self::start_info_poll(cx);
         // Poll for devices and keep the call counter fresh.
@@ -253,6 +292,7 @@ impl Hatch {
             self.entries.clear();
             self.apps.clear();
             self.preview = None;
+            self.shown = None;
         }
         if self.devices.is_empty() {
             self.status = "Connect an iPhone with a USB cable".into();
@@ -436,6 +476,17 @@ impl Hatch {
     fn load_dir(&mut self, cx: &mut Context<Self>) {
         let Some(udid) = self.udid.clone() else { return };
         let (root, path) = (self.root.clone(), self.path.clone());
+        // Remember where the user was in the folder on screen, and where they went in.
+        let entered = self.enter_from.take();
+        let left = self.shown.take();
+        if let Some((u, r, p)) = &left {
+            let key = spot_key(u, r, p);
+            let entry = entered.or_else(|| self.came_from.clone()).or_else(|| self.spots.get(&key).and_then(|s| s.entry.clone()));
+            self.spots.insert(key, Spot { y: self.files_scroll.offset().y, entry, names: names_hash(&self.entries), grid: self.grid });
+        }
+        // Back, a parent click, or Reload: the new folder holds the old one, or is the old one.
+        let back_from = left.filter(|(u, r, p)| *u == udid && *r == root && (p == &path || path == "/" || p.starts_with(&format!("{path}/")))).map(|(_, _, p)| p);
+        self.came_from = None;
         self.busy = true;
         self.epoch += 1;
         self.fill_epoch += 1;
@@ -450,13 +501,22 @@ impl Hatch {
         cx.notify();
         run(
             cx,
-            async move { device::list_dir(&udid, &root, &path).await.map_err(|e| device::explain(&e)) },
-            |this, r, cx| {
+            {
+                let (udid, root, path) = (udid.clone(), root.clone(), path.clone());
+                async move { device::list_dir(&udid, &root, &path).await.map_err(|e| device::explain(&e)) }
+            },
+            move |this, r, cx| {
+                // A newer folder load is on its way; drop this result.
+                if this.udid.as_deref() != Some(udid.as_str()) || this.root != root || this.path != path {
+                    return;
+                }
                 this.busy = false;
                 match r {
                     Ok(e) => {
                         this.status = format!("{} items", e.len());
                         this.entries = e;
+                        this.shown = Some((udid.clone(), root.clone(), path.clone()));
+                        this.restore_spot(back_from.as_deref());
                         if let Some(u) = this.udid.clone() {
                             let names: Vec<String> = this.entries.iter().map(|e| e.name.clone()).collect();
                             device::note_fill(&u, &this.root, &this.path, &names);
@@ -474,6 +534,32 @@ impl Hatch {
                 cx.notify();
             },
         );
+    }
+
+    /// After a listing loads: on Back, go to the old scroll offset and mark the folder the
+    /// user came out of. If the listing changed, scroll that entry into view instead.
+    /// Any other folder opens at the top.
+    fn restore_spot(&mut self, back_from: Option<&str>) {
+        let zero = point(px(0.), px(0.));
+        let Some(old) = back_from else {
+            self.files_scroll.set_offset(zero);
+            return;
+        };
+        let key = spot_key(self.udid.as_deref().unwrap_or(""), &self.root, &self.path);
+        let spot = self.spots.get(&key);
+        // The child of this folder on the way to the old one. Empty on Reload.
+        let base = if self.path == "/" { String::new() } else { self.path.clone() };
+        let child = old.strip_prefix(&format!("{base}/")).and_then(|rest| rest.split('/').next()).filter(|c| !c.is_empty()).map(str::to_string);
+        self.came_from = child.or_else(|| spot.and_then(|s| s.entry.clone())).filter(|n| self.entries.iter().any(|e| &e.name == n));
+        let same = spot.is_some_and(|s| s.names == names_hash(&self.entries) && s.grid == self.grid);
+        self.files_scroll.set_offset(spot.map_or(zero, |s| point(px(0.), s.y)));
+        if let (false, Some(name)) = (same, self.came_from.clone()) {
+            let skip = self.hidden_empty();
+            let ix = self.entries.iter().enumerate().filter(|(i, _)| !skip.contains(i)).position(|(_, e)| e.name == name);
+            if let Some(ix) = ix {
+                self.files_scroll.scroll_to_item(ix);
+            }
+        }
     }
 
     /// Reload button: list the folder again and check its subfolders again.
@@ -551,7 +637,8 @@ impl Hatch {
                 _ => false,
             };
             let on_path = self.path == full || self.path.starts_with(&format!("{full}/"));
-            if empty && !on_path && !self.is_fav(&root, &full) {
+            let marked = self.came_from.as_deref() == Some(e.name.as_str());
+            if empty && !on_path && !marked && !self.is_fav(&root, &full) {
                 out.insert(i);
             }
         }
@@ -573,6 +660,7 @@ impl Hatch {
     fn click_entry(&mut self, e: Entry, cx: &mut Context<Self>) {
         let full = if self.path == "/" { format!("/{}", e.name) } else { format!("{}/{}", self.path, e.name) };
         if e.is_dir {
+            self.enter_from = Some(e.name.clone());
             self.path = full;
             self.load_dir(cx);
             return;
@@ -1419,6 +1507,7 @@ impl Render for Hatch {
             let n = empty_set.len();
             let what = if n == 1 { "empty folder" } else { "empty folders" };
             h_flex()
+                .flex_none()
                 .px_4()
                 .py_3()
                 .w_full()
@@ -1535,12 +1624,14 @@ impl Render for Hatch {
         } else if self.entries.is_empty() && !self.busy {
             message(IconName::Folder, faint(), "This folder is empty", format!("{crumb} has no items.")).into_any_element()
         } else if self.grid {
-            let mut g = div().w_full().flex().flex_wrap().content_start();
+            // Tiles are direct children of the scroll box, so the scroll handle can find them.
+            let mut g = div().id("files").size_full().overflow_y_scroll().track_scroll(&self.files_scroll).flex().flex_wrap().content_start();
             for (i, e) in self.entries.iter().cloned().enumerate() {
                 if skip.contains(&i) {
                     continue;
                 }
                 let on = self.picked.contains(&e.name) && !e.is_dir;
+                let marked = e.is_dir && self.came_from.as_deref() == Some(e.name.as_str());
                 let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let thumb = self.thumbs.get(&format!("{}{}", self.root_key(), self.full(&e.name))).cloned();
                 let me = me.clone();
@@ -1557,7 +1648,7 @@ impl Render for Hatch {
                         .cursor_pointer()
                         .bg(wash())
                         .border_2()
-                        .border_color(if on { acc() } else { rgba(0x101315ff) })
+                        .border_color(if on || marked { acc() } else { rgba(0x101315ff) })
                         .child(match thumb {
                             Some(t) => img(t).size_full().object_fit(ObjectFit::Cover).into_any_element(),
                             None => div()
@@ -1583,7 +1674,7 @@ impl Render for Hatch {
                                 .items_center()
                                 .bg(rgba(0x0a0b0cb3))
                                 .text_size(px(11.))
-                                .text_color(if on { ink() } else { dim() })
+                                .text_color(if on || marked { ink() } else { dim() })
                                 .child(div().truncate().child(if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })),
                         )
                         .hover(|d| d.bg(wash2()))
@@ -1594,14 +1685,16 @@ impl Render for Hatch {
                         }),
                 );
             }
-            div().id("files").size_full().overflow_y_scroll().child(g).children(empty_note).into_any_element()
+            g.children(empty_note).into_any_element()
         } else {
-            let mut list = v_flex();
+            // Rows are direct children of the scroll box, so the scroll handle can find them.
+            let mut list = v_flex().id("files").size_full().overflow_y_scroll().track_scroll(&self.files_scroll);
             for (i, e) in self.entries.iter().cloned().enumerate() {
                 if skip.contains(&i) {
                     continue;
                 }
                 let on = self.picked.contains(&e.name) && !e.is_dir;
+                let marked = e.is_dir && self.came_from.as_deref() == Some(e.name.as_str());
                 let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let me = me.clone();
                 let e2 = e.clone();
@@ -1615,8 +1708,8 @@ impl Render for Hatch {
                         .items_center()
                         .cursor_pointer()
                         .border_l_2()
-                        .border_color(if on { acc() } else { none() })
-                        .when(on, |d| d.bg(acc_s()))
+                        .border_color(if on || marked { acc() } else { none() })
+                        .when(on || marked, |d| d.bg(acc_s()))
                         .hover(|d| d.bg(wash()))
                         .child(
                             div()
@@ -1638,7 +1731,7 @@ impl Render for Hatch {
                         }),
                 );
             }
-            div().id("files").size_full().overflow_y_scroll().child(list).children(empty_note).into_any_element()
+            list.children(empty_note).into_any_element()
         };
 
         let main = if self.page_settings {
