@@ -117,6 +117,21 @@ struct Hatch {
     focus: FocusHandle,
     /// Sync jobs, the job editor, and the auto-run queue.
     sync: sync_ui::SyncUi,
+    /// Root key + path of the folder where the user clicked "Show" for empty folders.
+    show_empty_at: Option<String>,
+    /// Bumped on each folder load; a running emptiness check stops when it changes.
+    fill_epoch: u64,
+}
+
+/// Only the first this many subfolders of a folder are checked. The rest stay visible.
+const FILL_CAP: usize = 200;
+/// Subfolders listed per background step. The UI updates between steps.
+const FILL_STEP: usize = 25;
+
+/// Hatch shows dotfiles in the file list, so a folder of only dotfiles is not empty.
+/// If a "hide dotfiles" option arrives, return it here.
+fn hide_dotfiles() -> bool {
+    false
 }
 
 impl Hatch {
@@ -172,6 +187,8 @@ impl Hatch {
             token,
             focus: cx.focus_handle(),
             sync: sync_ui::SyncUi::load(),
+            show_empty_at: None,
+            fill_epoch: 0,
         };
         Self::start_info_poll(cx);
         // Poll for devices and keep the call counter fresh.
@@ -421,6 +438,10 @@ impl Hatch {
         let (root, path) = (self.root.clone(), self.path.clone());
         self.busy = true;
         self.epoch += 1;
+        self.fill_epoch += 1;
+        if self.show_empty_at.as_deref() != Some(self.here_key().as_str()) {
+            self.show_empty_at = None;
+        }
         self.selected = None;
         self.picked.clear();
         self.anchor = None;
@@ -436,9 +457,14 @@ impl Hatch {
                     Ok(e) => {
                         this.status = format!("{} items", e.len());
                         this.entries = e;
+                        if let Some(u) = this.udid.clone() {
+                            let names: Vec<String> = this.entries.iter().map(|e| e.name.clone()).collect();
+                            device::note_fill(&u, &this.root, &this.path, &names);
+                        }
                         if this.grid {
                             this.load_thumbs(cx);
                         }
+                        this.check_empty(cx);
                     }
                     Err(e) => {
                         this.entries.clear();
@@ -448,6 +474,88 @@ impl Hatch {
                 cx.notify();
             },
         );
+    }
+
+    /// Reload button: list the folder again and check its subfolders again.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(u) = self.udid.clone() {
+            device::forget_children(&u, &self.root, &self.path);
+        }
+        self.load_dir(cx);
+    }
+
+    fn here_key(&self) -> String {
+        format!("{}{}", self.root_key(), self.path)
+    }
+
+    /// In the background, list each unchecked subfolder of the open folder (up to FILL_CAP)
+    /// so empty ones can be hidden. Runs after the listing shows; a folder change stops it.
+    fn check_empty(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.hide_empty {
+            return;
+        }
+        let Some(udid) = self.udid.clone() else { return };
+        let root = self.root.clone();
+        let todo: Vec<String> = self
+            .entries
+            .iter()
+            .take(FILL_CAP)
+            .filter(|e| e.is_dir)
+            .map(|e| self.full(&e.name))
+            .filter(|p| device::cached_fill(&udid, &root, p).is_none())
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let epoch = self.fill_epoch;
+        cx.spawn(async move |this, cx| {
+            for chunk in todo.chunks(FILL_STEP) {
+                let (u, r, c) = (udid.clone(), root.clone(), chunk.to_vec());
+                let res = rt().spawn(async move { device::check_fills(&u, &r, &c).await }).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.fill_epoch != epoch {
+                            return false;
+                        }
+                        if matches!(res, Ok(Ok(ref v)) if v.iter().any(|(_, f)| *f != device::Fill::Full)) {
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Indexes into `entries` of the folders hidden as empty. Never the open folder,
+    /// a favorite, or a folder on the breadcrumb path.
+    fn hidden_empty(&self) -> std::collections::HashSet<usize> {
+        let mut out = std::collections::HashSet::new();
+        let Some(udid) = self.udid.as_deref() else { return out };
+        if !self.settings.hide_empty {
+            return out;
+        }
+        let root = self.root_str();
+        for (i, e) in self.entries.iter().enumerate().take(FILL_CAP) {
+            if !e.is_dir {
+                continue;
+            }
+            let full = self.full(&e.name);
+            let empty = match device::cached_fill(udid, &self.root, &full) {
+                Some(device::Fill::Empty) => true,
+                Some(device::Fill::DotOnly) => hide_dotfiles(),
+                _ => false,
+            };
+            let on_path = self.path == full || self.path.starts_with(&format!("{full}/"));
+            if empty && !on_path && !self.is_fav(&root, &full) {
+                out.insert(i);
+            }
+        }
+        out
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
@@ -527,12 +635,20 @@ impl Hatch {
 }
 
 // Glass palette: near-black translucent ground, warm greys, one soft emerald accent.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
     /// Location keys hidden from the sidebar: "media" or an app bundle id.
     hidden: Vec<String>,
     start_in_grid: bool,
+    /// Hide folders with no entries in the file list and grid.
+    hide_empty: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { hidden: vec![], start_in_grid: false, hide_empty: true }
+    }
 }
 
 fn settings_file() -> std::path::PathBuf {
@@ -764,6 +880,20 @@ impl Hatch {
             |this, v, cx| {
                 this.settings.start_in_grid = v;
                 save_settings(&this.settings);
+                cx.notify();
+            },
+        ));
+        page = page.child(self.settings_row(
+            "set-hide-empty".into(),
+            IconName::Folder,
+            "Hide empty folders".into(),
+            Some("Folders with nothing inside. The agent still sees them".into()),
+            self.settings.hide_empty,
+            cx,
+            |this, v, cx| {
+                this.settings.hide_empty = v;
+                save_settings(&this.settings);
+                this.check_empty(cx);
                 cx.notify();
             },
         ));
@@ -1192,6 +1322,36 @@ impl Render for Hatch {
                     .child(div().font_family(mono()).child(format!("127.0.0.1:{} · {} calls", mcp::PORT, calls))),
             );
 
+        // ---- empty folders hidden in this folder
+        let empty_set = self.hidden_empty();
+        let showing_empty = self.show_empty_at.as_deref() == Some(self.here_key().as_str());
+        let skip: std::collections::HashSet<usize> = if showing_empty { Default::default() } else { empty_set.clone() };
+        let empty_note: Option<AnyElement> = (!empty_set.is_empty()).then(|| {
+            let n = empty_set.len();
+            let what = if n == 1 { "empty folder" } else { "empty folders" };
+            h_flex()
+                .px_4()
+                .py_3()
+                .w_full()
+                .gap_1()
+                .text_size(px(12.))
+                .text_color(faint())
+                .child(format!("{n} {what} {} ·", if showing_empty { "shown" } else { "hidden" }))
+                .child(
+                    div()
+                        .id("empty-toggle")
+                        .cursor_pointer()
+                        .text_color(acc())
+                        .hover(|d| d.underline())
+                        .child(if showing_empty { "Hide" } else { "Show" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.show_empty_at = if showing_empty { None } else { Some(this.here_key()) };
+                            cx.notify();
+                        })),
+                )
+                .into_any_element()
+        });
+
         // ---- toolbar
         let (fav_root, fav_path) = (self.root_str(), self.path.clone());
         let is_fav_here = self.is_fav(&fav_root, &fav_path);
@@ -1204,7 +1364,7 @@ impl Render for Hatch {
             .border_b_1()
             .border_color(line())
             .child(self.icon_btn("up", IconName::ArrowLeft, false, paired && self.path != "/", cx, |t, cx| t.go_up(cx)))
-            .child(self.icon_btn("reload", IconName::Redo, false, paired, cx, |t, cx| t.load_dir(cx)))
+            .child(self.icon_btn("reload", IconName::Redo, false, paired, cx, |t, cx| t.reload(cx)))
             .child(
                 h_flex()
                     .flex_1()
@@ -1220,7 +1380,7 @@ impl Render for Hatch {
                     .text_color(ink())
                     .child(div().truncate().child(crumb.clone())),
             )
-            .child(div().flex_none().text_size(px(12.)).text_color(faint()).child(if self.busy { "Loading…".to_string() } else { format!("{} items", self.entries.len()) }))
+            .child(div().flex_none().text_size(px(12.)).text_color(faint()).child(if self.busy { "Loading…".to_string() } else { format!("{} items", self.entries.len() - skip.len()) }))
             .child({
                 let (r, p) = (fav_root.clone(), fav_path.clone());
                 self.icon_btn("fav-here", IconName::Star, is_fav_here, paired && self.path != "/", cx, move |t, cx| t.toggle_fav(r.clone(), p.clone(), cx))
@@ -1286,8 +1446,11 @@ impl Render for Hatch {
         } else if self.entries.is_empty() && !self.busy {
             message(IconName::Folder, faint(), "This folder is empty", format!("{crumb} has no items.")).into_any_element()
         } else if self.grid {
-            let mut g = div().id("files").size_full().overflow_y_scroll().flex().flex_wrap().content_start();
+            let mut g = div().w_full().flex().flex_wrap().content_start();
             for (i, e) in self.entries.iter().cloned().enumerate() {
+                if skip.contains(&i) {
+                    continue;
+                }
                 let on = self.picked.contains(&e.name) && !e.is_dir;
                 let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let thumb = self.thumbs.get(&format!("{}{}", self.root_key(), self.full(&e.name))).cloned();
@@ -1342,10 +1505,13 @@ impl Render for Hatch {
                         }),
                 );
             }
-            g.into_any_element()
+            div().id("files").size_full().overflow_y_scroll().child(g).children(empty_note).into_any_element()
         } else {
             let mut list = v_flex();
             for (i, e) in self.entries.iter().cloned().enumerate() {
+                if skip.contains(&i) {
+                    continue;
+                }
                 let on = self.picked.contains(&e.name) && !e.is_dir;
                 let drop_dir = e.is_dir.then(|| self.full(&e.name));
                 let me = me.clone();
@@ -1383,7 +1549,7 @@ impl Render for Hatch {
                         }),
                 );
             }
-            div().id("files").size_full().overflow_y_scroll().child(list).into_any_element()
+            div().id("files").size_full().overflow_y_scroll().child(list).children(empty_note).into_any_element()
         };
 
         let main = if self.page_settings {

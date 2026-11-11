@@ -326,6 +326,88 @@ pub async fn list_dir(udid: &str, root: &Root, path: &str) -> Result<Vec<Entry>>
     Ok(out)
 }
 
+/// What a folder holds, for "hide empty folders".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fill {
+    Empty,
+    /// Only names that start with a dot.
+    DotOnly,
+    Full,
+}
+
+type FillKey = (String, Root, String);
+
+fn fill_cache() -> &'static std::sync::Mutex<std::collections::HashMap<FillKey, Fill>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<FillKey, Fill>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn norm(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    if p.is_empty() { "/".into() } else { p.to_string() }
+}
+
+fn parent_of(path: &str) -> String {
+    let n = norm(path);
+    match n.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(i) => n[..i].to_string(),
+    }
+}
+
+/// The cached fill of a folder (root-relative path), if it was checked.
+pub fn cached_fill(udid: &str, root: &Root, path: &str) -> Option<Fill> {
+    fill_cache().lock().unwrap().get(&(udid.to_string(), root.clone(), norm(path))).copied()
+}
+
+/// Record the fill of a folder from a listing the UI already has.
+pub fn note_fill(udid: &str, root: &Root, path: &str, names: &[String]) {
+    let f = if names.is_empty() {
+        Fill::Empty
+    } else if names.iter().all(|n| n.starts_with('.')) {
+        Fill::DotOnly
+    } else {
+        Fill::Full
+    };
+    fill_cache().lock().unwrap().insert((udid.to_string(), root.clone(), norm(path)), f);
+}
+
+/// Drop the cached fill of every direct child of `dir` (the user reloaded `dir`).
+pub fn forget_children(udid: &str, root: &Root, dir: &str) {
+    let dir = norm(dir);
+    fill_cache().lock().unwrap().retain(|(u, r, p), _| !(u == udid && r == root && p != "/" && parent_of(p) == dir));
+}
+
+/// A write at `path` changes what `path` and its parent hold.
+fn touched(udid: &str, root: &Root, path: &str) {
+    let mut c = fill_cache().lock().unwrap();
+    for p in [norm(path), parent_of(path)] {
+        c.remove(&(udid.to_string(), root.clone(), p));
+    }
+}
+
+/// List each folder (root-relative paths) on the pooled connection and cache its fill.
+/// A folder that cannot be listed is left out, so it stays visible.
+pub async fn check_fills(udid: &str, root: &Root, paths: &[String]) -> Result<Vec<(String, Fill)>> {
+    let out = with_afc!(udid, root, |c| {
+        let mut out = Vec::new();
+        for p in paths {
+            let Ok(mut names) = c.list_dir(real(root, p).as_str()).await else { continue };
+            names.retain(|n| n != "." && n != "..");
+            out.push((p.clone(), names));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+    Ok(out
+        .into_iter()
+        .map(|(p, names)| {
+            note_fill(udid, root, &p, &names);
+            let f = cached_fill(udid, root, &p).unwrap_or(Fill::Full);
+            (p, f)
+        })
+        .collect())
+}
+
 /// Read at most `max` bytes from the start of the file. Returns the bytes and the file size.
 async fn read_head(c: &mut AfcClient, path: &str, max: usize) -> Result<(Vec<u8>, u64)> {
     let info = c.get_file_info(path).await?;
@@ -390,6 +472,8 @@ pub async fn preview_image(udid: &str, root: &Root, path: &str) -> Result<Vec<u8
 }
 
 pub async fn write_file(udid: &str, root: &Root, path: &str, data: &[u8]) -> Result<()> {
+    let orig = path.to_string();
+    touched(udid, root, path);
     let path = real(root, path);
     with_afc!(udid, root, |c| {
         let mut f = c.open(path.as_str(), AfcFopenMode::WrOnly).await?;
@@ -397,18 +481,25 @@ pub async fn write_file(udid: &str, root: &Root, path: &str, data: &[u8]) -> Res
         f.close().await.ok();
         w.map_err(anyhow::Error::from)
     });
+    touched(udid, root, &orig);
     Ok(())
 }
 
 pub async fn make_dir(udid: &str, root: &Root, path: &str) -> Result<()> {
+    let orig = path.to_string();
+    touched(udid, root, path);
     let path = real(root, path);
     with_afc!(udid, root, |c| c.mk_dir(path.as_str()).await.map_err(anyhow::Error::from));
+    touched(udid, root, &orig);
     Ok(())
 }
 
 pub async fn delete(udid: &str, root: &Root, path: &str) -> Result<()> {
+    let orig = path.to_string();
+    touched(udid, root, path);
     let path = real(root, path);
     with_afc!(udid, root, |c| c.remove_all(path.as_str()).await.map_err(anyhow::Error::from));
+    touched(udid, root, &orig);
     Ok(())
 }
 
@@ -605,6 +696,7 @@ async fn copy_in(c: &mut AfcClient, local: &std::path::Path, remote: &str, t: &T
 /// " (2)" suffix; nothing on the phone is replaced. Returns the phone paths written.
 /// The user always may upload. The MCP "Agent writes" gate does not apply here.
 pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::PathBuf], t: &Transfer) -> Result<Vec<String>> {
+    touched(udid, root, dir);
     let mut c = connect(udid, root).await?;
     let total: u64 = files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
     t.total.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -623,6 +715,7 @@ pub async fn upload(udid: &str, root: &Root, dir: &str, files: &[std::path::Path
         written.push(join(dir, &name));
         t.files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    touched(udid, root, dir);
     Ok(written)
 }
 
@@ -697,6 +790,12 @@ pub async fn upload_to(udid: &str, root: &Root, files: &[(std::path::PathBuf, St
     let mut out = Vec::new();
     for (local, remote) in files {
         t.check()?;
+        // Each new file can fill its folder and the folders above it.
+        let mut p = remote.clone();
+        while p != "/" && !p.is_empty() {
+            touched(udid, root, &p);
+            p = parent_of(&p);
+        }
         let full = real(root, remote);
         // Make each missing parent folder, top down.
         let mut parent = String::new();
