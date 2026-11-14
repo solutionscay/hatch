@@ -15,7 +15,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-pub const PORT: u16 = 7433;
+pub const DEFAULT_PORT: u16 = 7433;
+
+/// The MCP port. `HATCH_MCP_PORT` overrides it, so a second copy can run beside the first.
+pub fn port() -> u16 {
+    std::env::var("HATCH_MCP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT)
+}
 
 fn token_file() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -99,7 +104,7 @@ pub struct McpState {
 
 pub async fn serve(state: McpState) -> anyhow::Result<()> {
     let app = Router::new().route("/mcp", post(handle)).with_state(state);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", PORT)).await?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port())).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

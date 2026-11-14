@@ -50,6 +50,9 @@ fn b(d: &Dictionary, k: &str) -> Option<bool> {
 
 /// Read identity, battery and storage. Only GetValue requests: nothing changes on the phone.
 pub async fn device_info(udid: &str) -> Result<DeviceInfo> {
+    if crate::demo::on() {
+        return Ok(crate::demo::info());
+    }
     let p = device::provider_for(udid).await?;
     let mut l = device::session(&p).await?;
     let id = l.get_value(None, None).await?.into_dictionary().unwrap_or_default();

@@ -1,3 +1,4 @@
+mod demo;
 mod device;
 mod devinfo;
 mod mcp;
@@ -175,7 +176,7 @@ impl Hatch {
         let state = mcp::McpState { allow_writes: allow_writes.clone(), calls: calls.clone(), log: log.clone(), token: token.clone() };
         let mut error = None;
         // Bind synchronously so a port clash shows up in the UI.
-        match std::net::TcpListener::bind(("127.0.0.1", mcp::PORT)) {
+        match std::net::TcpListener::bind(("127.0.0.1", mcp::port())) {
             Ok(l) => {
                 drop(l);
                 rt().spawn(async move {
@@ -184,7 +185,7 @@ impl Hatch {
                     }
                 });
             }
-            Err(e) => error = Some(format!("MCP port {} unavailable: {e}", mcp::PORT)),
+            Err(e) => error = Some(format!("MCP port {} unavailable: {e}", mcp::port())),
         }
         let this = Self {
             grid: load_settings().start_in_grid,
@@ -1127,7 +1128,7 @@ impl Hatch {
     }
 
     fn agents_page(&self, mut page: Div, cx: &mut Context<Self>) -> Div {
-        let url = format!("http://127.0.0.1:{}/mcp", mcp::PORT);
+        let url = format!("http://127.0.0.1:{}/mcp", mcp::port());
         let token = self.token.read().unwrap().clone();
         let writes = self.allow_writes.load(Ordering::Relaxed);
         page = page.child(section("Agent"));
@@ -1443,7 +1444,7 @@ impl Render for Hatch {
                     .text_size(px(11.))
                     .text_color(faint())
                     .child(div().size(px(6.)).bg(acc()))
-                    .child(div().font_family(mono()).child(format!("127.0.0.1:{} · {} calls", mcp::PORT, calls))),
+                    .child(div().font_family(mono()).child(format!("127.0.0.1:{} · {} calls", mcp::port(), calls))),
             );
 
         // ---- empty folders hidden by the Settings switch

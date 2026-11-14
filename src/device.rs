@@ -90,6 +90,9 @@ pub fn usbmuxd_help() -> String {
 }
 
 async fn mux() -> Result<UsbmuxdConnection> {
+    if crate::demo::on() {
+        bail!("Demo mode does not connect to a phone.");
+    }
     UsbmuxdConnection::default().await.map_err(|_| anyhow::Error::new(MuxDown))
 }
 
@@ -134,6 +137,9 @@ pub(crate) async fn provider_for(udid: &str) -> Result<UsbmuxdProvider> {
 }
 
 pub async fn list_devices() -> Result<Vec<Device>> {
+    if crate::demo::on() {
+        return Ok(crate::demo::devices());
+    }
     let mut mux = mux().await?;
     let devices = mux.get_devices().await?;
     let mut out = Vec::new();
@@ -201,6 +207,9 @@ pub async fn pair(udid: &str) -> Result<()> {
 }
 
 pub async fn list_apps(udid: &str) -> Result<Vec<App>> {
+    if crate::demo::on() {
+        return Ok(crate::demo::apps());
+    }
     let p = provider_for(udid).await?;
     let mut ip = InstallationProxyClient::connect(&p).await?;
     let apps = ip.get_apps(Some("User"), None).await?;
@@ -300,6 +309,9 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 pub async fn list_dir(udid: &str, root: &Root, path: &str) -> Result<Vec<Entry>> {
+    if crate::demo::on() {
+        return crate::demo::list_dir(root, path);
+    }
     let path = real(root, if path.is_empty() { "/" } else { path });
     let mut out = with_afc!(udid, root, |c| {
         let mut names = c.list_dir(path.as_str()).await?;
@@ -389,6 +401,17 @@ fn touched(udid: &str, root: &Root, path: &str) {
 /// List each folder (root-relative paths) on the pooled connection and cache its fill.
 /// A folder that cannot be listed is left out, so it stays visible.
 pub async fn check_fills(udid: &str, root: &Root, paths: &[String]) -> Result<Vec<(String, Fill)>> {
+    if crate::demo::on() {
+        let found: Vec<_> = paths.iter().filter_map(|p| crate::demo::names(root, p).map(|n| (p.clone(), n))).collect();
+        return Ok(found
+            .into_iter()
+            .map(|(p, n)| {
+                note_fill(udid, root, &p, &n);
+                let f = cached_fill(udid, root, &p).unwrap_or(Fill::Full);
+                (p, f)
+            })
+            .collect());
+    }
     let out = with_afc!(udid, root, |c| {
         let mut out = Vec::new();
         for p in paths {
@@ -428,6 +451,9 @@ async fn read_head(c: &mut AfcClient, path: &str, max: usize) -> Result<(Vec<u8>
 
 /// Read a file. `max` caps the number of bytes read from the phone and returned.
 pub async fn read_file(udid: &str, root: &Root, path: &str, max: usize) -> Result<(Vec<u8>, u64)> {
+    if crate::demo::on() {
+        return crate::demo::read_file(root, path, max);
+    }
     let path = real(root, path);
     Ok(with_afc!(udid, root, |c| read_head(&mut c, &path, max).await))
 }
@@ -435,7 +461,7 @@ pub async fn read_file(udid: &str, root: &Root, path: &str, max: usize) -> Resul
 /// A JPEG preview for a photo or video. Uses the phone's own thumbnail cache for DCIM
 /// files (works for HEIC and video), else reads small image files directly.
 pub async fn preview_image(udid: &str, root: &Root, path: &str) -> Result<Vec<u8>> {
-    if *root == Root::Media {
+    if *root == Root::Media && !crate::demo::on() {
         if let Some(rest) = path.strip_prefix("/DCIM/") {
             let dir = format!("/PhotoData/Thumbnails/V2/DCIM/{rest}");
             let thumb = with_afc!(udid, root, |c| {
@@ -472,6 +498,9 @@ pub async fn preview_image(udid: &str, root: &Root, path: &str) -> Result<Vec<u8
 }
 
 pub async fn write_file(udid: &str, root: &Root, path: &str, data: &[u8]) -> Result<()> {
+    if crate::demo::on() {
+        return crate::demo::refuse();
+    }
     let orig = path.to_string();
     touched(udid, root, path);
     let path = real(root, path);
@@ -486,6 +515,9 @@ pub async fn write_file(udid: &str, root: &Root, path: &str, data: &[u8]) -> Res
 }
 
 pub async fn make_dir(udid: &str, root: &Root, path: &str) -> Result<()> {
+    if crate::demo::on() {
+        return crate::demo::refuse();
+    }
     let orig = path.to_string();
     touched(udid, root, path);
     let path = real(root, path);
@@ -495,6 +527,9 @@ pub async fn make_dir(udid: &str, root: &Root, path: &str) -> Result<()> {
 }
 
 pub async fn delete(udid: &str, root: &Root, path: &str) -> Result<()> {
+    if crate::demo::on() {
+        return crate::demo::refuse();
+    }
     let orig = path.to_string();
     touched(udid, root, path);
     let path = real(root, path);
